@@ -64,7 +64,7 @@ _users        = _db["users"] if _db is not None else None
 
 
 async def db_upsert_user(user_id: int, first_name: str, username: str | None):
-    if not _users:
+    if _users is None:
         return
     try:
         await _users.update_one(
@@ -80,7 +80,7 @@ async def db_upsert_user(user_id: int, first_name: str, username: str | None):
 
 
 async def db_get_thumb(user_id: int) -> str | None:
-    if not _users:
+    if _users is None:
         return None
     try:
         doc = await _users.find_one({"_id": user_id}, {"custom_thumb": 1})
@@ -90,7 +90,7 @@ async def db_get_thumb(user_id: int) -> str | None:
 
 
 async def db_set_thumb(user_id: int, file_id: str | None):
-    if not _users:
+    if _users is None:
         return
     try:
         await _users.update_one(
@@ -103,7 +103,7 @@ async def db_set_thumb(user_id: int, file_id: str | None):
 
 
 async def db_count_users() -> int:
-    if not _users:
+    if _users is None:
         return 0
     try:
         return await _users.count_documents({})
@@ -113,7 +113,7 @@ async def db_count_users() -> int:
 
 async def db_iter_user_ids():
     """Async generator — yields user _id one by one."""
-    if not _users:
+    if _users is None:
         return
     try:
         async for doc in _users.find({}, {"_id": 1}):
