@@ -1,20 +1,17 @@
 """
-YT-DLP Downloader Bot  v5.0
+YouTube Downloader Bot  v6.0
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━
-• All 1500+ yt-dlp sites supported
+• YouTube download via ytdown.to (y2mate API — no bot detection)
 • Live download + upload progress bar with Cancel button
 • 2 force-subscribe channels
 • Custom user thumbnail (stored in MongoDB)
-• MongoDB for user tracking & persistence
-• YouTube cookies hot-reload without restart
+• MongoDB for user tracking
 • Admin broadcast (text / photo / video / document) to all users
 • Commands auto-registered on every startup
 • Up to 2 GB uploads via Pyrogram MTProto
-• YouTube: ios/tv_embedded player client (no bot-detection) + cobalt.tools fallback
 """
 
 import asyncio
-import base64
 import hashlib
 import http.server
 import logging
@@ -22,9 +19,7 @@ import os
 import re
 import tempfile
 import threading
-import time
 from datetime import datetime, timezone
-from pathlib import Path
 
 import aiohttp
 
@@ -52,8 +47,6 @@ logger = logging.getLogger(__name__)
 # ═══════════════════════════════════════════════════════════════════════════════
 #  PYROGRAM CLIENT
 # ═══════════════════════════════════════════════════════════════════════════════
-# STRING_SESSION keeps the same Telegram session across Heroku restarts.
-# Without it, every restart creates a new auth key → FloodWait 420.
 _session_name = config.STRING_SESSION if config.STRING_SESSION else ":memory:"
 app = Client(
     _session_name,
@@ -111,44 +104,6 @@ async def db_set_thumb(user_id: int, file_id: str | None):
         logger.error("db_set_thumb: %s", e)
 
 
-async def db_save_cookies(raw: bytes) -> None:
-    """Persist cookies bytes to MongoDB so they survive Heroku restarts."""
-    if _settings is None:
-        return
-    try:
-        await _settings.update_one(
-            {"_id": "cookies"},
-            {"$set": {"data": base64.b64encode(raw).decode(), "updated_at": datetime.now(timezone.utc)}},
-            upsert=True,
-        )
-        logger.info("Cookies saved to MongoDB (%d bytes).", len(raw))
-    except Exception as e:
-        logger.error("db_save_cookies: %s", e)
-
-
-async def db_load_cookies() -> bytes | None:
-    """Load cookies bytes from MongoDB. Returns None if not stored."""
-    if _settings is None:
-        return None
-    try:
-        doc = await _settings.find_one({"_id": "cookies"})
-        if doc and doc.get("data"):
-            return base64.b64decode(doc["data"])
-    except Exception as e:
-        logger.error("db_load_cookies: %s", e)
-    return None
-
-
-async def db_delete_cookies() -> None:
-    if _settings is None:
-        return
-    try:
-        await _settings.delete_one({"_id": "cookies"})
-        logger.info("Cookies removed from MongoDB.")
-    except Exception as e:
-        logger.error("db_delete_cookies: %s", e)
-
-
 async def db_count_users() -> int:
     if _users is None:
         return 0
@@ -159,7 +114,6 @@ async def db_count_users() -> int:
 
 
 async def db_iter_user_ids():
-    """Async generator — yields user _id one by one."""
     if _users is None:
         return
     try:
@@ -170,39 +124,10 @@ async def db_iter_user_ids():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  COOKIES SETUP
-# ═══════════════════════════════════════════════════════════════════════════════
-_RUNTIME_COOKIES = Path("runtime_cookies.txt")
-_cookies_path: Path | None = None
-
-
-def _init_cookies() -> Path | None:
-    global _cookies_path
-    if config.COOKIES_B64:
-        try:
-            _RUNTIME_COOKIES.write_bytes(base64.b64decode(config.COOKIES_B64))
-            logger.info("Cookies loaded from COOKIES_B64.")
-            return _RUNTIME_COOKIES
-        except Exception as e:
-            logger.error("COOKIES_B64 decode failed: %s", e)
-    p = Path(config.COOKIES_FILE)
-    if p.exists():
-        logger.info("Cookies loaded from file: %s", p)
-        return p
-    logger.info("No cookies — public content only.")
-    return None
-
-
-_cookies_path = _init_cookies()
-
-# ═══════════════════════════════════════════════════════════════════════════════
 #  IN-MEMORY STATE
 # ═══════════════════════════════════════════════════════════════════════════════
 # url_hash → {"url", "title", "thumb", "formats": list[dict]}
 pending: dict[str, dict] = {}
-
-# url_hash → asyncio.subprocess.Process  (for cancellation)
-active_procs: dict[str, asyncio.subprocess.Process] = {}
 
 # url_hash → asyncio.Event  (cancel signal)
 cancel_events: dict[str, asyncio.Event] = {}
@@ -215,17 +140,6 @@ broadcast_waiting: set[int] = set()
 
 # admin_id → pyrogram.Message  (message captured, waiting for confirm/cancel)
 broadcast_pending: dict[int, object] = {}
-
-# admin_id → pyrogram.Message  (cookies document message, waiting for confirmation)
-cookies_doc_pending: dict[int, object] = {}
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  PROGRESS REGEX  (yt-dlp --newline output)
-# ═══════════════════════════════════════════════════════════════════════════════
-_PROG_RE = re.compile(
-    r"\[download\]\s+([\d.]+)%\s+of\s+~?([\d.]+\s*\S+)\s+at\s+([\d.]+\s*\S+/s)\s+ETA\s+([\d:]+)"
-)
-_FRAG_RE = re.compile(r"\(frag\s+(\d+)/(\d+)\)")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -244,7 +158,6 @@ async def _check_one(user_id: int, channel: str) -> bool:
 
 
 async def check_sub(user_id: int) -> dict:
-    """Returns {"ch1": bool, "ch2": bool, "ok": bool}"""
     c1 = await _check_one(user_id, config.FORCE_CHANNEL_1)
     c2 = await _check_one(user_id, config.FORCE_CHANNEL_2)
     return {"ch1": c1, "ch2": c2, "ok": c1 and c2}
@@ -330,9 +243,8 @@ def cap_welcome(name: str) -> str:
     lines += [
         "━━━━━━━━━━━━━━━━━━━━",
         "\n🎬 *What you'll get after joining:*",
-        "  • Download from YouTube, Instagram, TikTok, Twitter & 1500+ sites",
-        "  • Pick any quality — 144p up to 4K",
-        "  • MP4 video or MP3 / AAC / FLAC audio",
+        "  • Download YouTube videos in any quality",
+        "  • Pick 144p up to 4K, or MP3 audio",
         "  • Live progress bar while downloading",
         "  • Custom thumbnail on your downloads",
         "  • Up to **2 GB** per file",
@@ -344,10 +256,9 @@ def cap_home(name: str) -> str:
     return (
         f"🏠 *Home — Hello, {name}!*\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "🌐 *Universal Media Downloader*\n\n"
-        "Send me any video link — YouTube, Instagram, TikTok, Twitter,\n"
-        "Facebook, Reddit, Vimeo and **1500+ other sites**.\n\n"
-        "I'll fetch all available qualities so you can pick exactly what you want.\n\n"
+        "🎬 *YouTube Video Downloader*\n\n"
+        "Send me any YouTube link and I'll fetch all available\n"
+        "qualities so you can pick exactly what you want.\n\n"
         f"📦 *Max file:*  {config.MAX_FILE_SIZE // (1024**3)} GB  "
         "⚡ Fast  🔒 Private  🎯 Your Choice"
     )
@@ -356,27 +267,22 @@ def cap_home(name: str) -> str:
 CAP_HOWTO = (
     "⬇️ *How to Download*\n"
     "━━━━━━━━━━━━━━━━━━━━\n\n"
-    "1️⃣  Copy any video/audio link\n"
+    "1️⃣  Copy any YouTube link\n"
     "2️⃣  Paste it in this chat\n"
     "3️⃣  Choose your quality from the buttons\n"
     "4️⃣  Watch live progress, then receive your file 🚀\n\n"
-    "🌐 *Supported sites:*\n"
-    "YouTube · Instagram · TikTok · Twitter/X · Facebook\n"
-    "Reddit · Vimeo · Dailymotion · SoundCloud · and 1500+ more\n\n"
-    "📦 *Video:*  MP4  |  🎵 *Audio:*  MP3 · AAC · FLAC · Opus · WAV\n"
-    "📏 *Resolutions:*  144p  →  4K (2160p)\n\n"
-    "🖼️ *Custom thumbnail:*  Set your own thumb via *My Thumbnail* in the menu"
+    "🎬 *Supported:* YouTube (youtube.com, youtu.be)\n\n"
+    "📦 *Video:*  MP4  |  🎵 *Audio:*  MP3\n"
+    "📏 *Resolutions:*  144p  →  4K (2160p)"
 )
 
 CAP_HELP = (
     "❓ *Help & FAQ*\n"
     "━━━━━━━━━━━━━━━━━━━━\n\n"
     "🔹 *What sites are supported?*\n"
-    "1500+ platforms — YouTube, Instagram, TikTok, Twitter, Facebook, etc.\n\n"
+    "YouTube (youtube.com and youtu.be links).\n\n"
     "🔹 *Why is a quality missing?*\n"
-    "Not all platforms offer all resolutions.\n\n"
-    "🔹 *Age-restricted / private videos?*\n"
-    "Possible if the admin has set cookies.\n\n"
+    "Not all videos are available in all resolutions.\n\n"
     "🔹 *How to set my own thumbnail?*\n"
     "Tap *My Thumbnail* in the home menu, then *Set My Thumbnail* and send a photo.\n\n"
     "🔹 *Can I cancel a download?*\n"
@@ -390,16 +296,14 @@ CAP_HELP = (
 CAP_ABOUT = (
     "ℹ️ *About This Bot*\n"
     "━━━━━━━━━━━━━━━━━━━━\n\n"
-    "🤖  *Universal Downloader Bot*\n"
-    "🌐  Powered by `yt-dlp` — 1500+ sites\n"
+    "🤖  *YouTube Downloader Bot*\n"
+    "🌐  Powered by *ytdown.to* API\n"
     "🐍  Built with `Pyrogram` (MTProto)\n"
     f"📦  Supports up to *{config.MAX_FILE_SIZE // (1024**3)} GB*\n"
-    "🍪  Cookie-aware for restricted content\n"
     "🗄️  MongoDB for user data\n"
     "🖼️  Custom thumbnails per user\n"
-    "🔒  Privacy-first — zero video data stored\n"
-    "🌐  Language: English\n\n"
-    "📌  *Version:* 3.0.0\n"
+    "🔒  Privacy-first — zero video data stored\n\n"
+    "📌  *Version:* 6.0\n"
     "_Made with ❤️ for fast, quality downloads._"
 )
 
@@ -438,9 +342,16 @@ async def send_menu(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  URL VALIDATION
+#  HELPERS
 # ═══════════════════════════════════════════════════════════════════════════════
 _URL_RE = re.compile(r"https?://[^\s<>\"{}|\\^`\[\]]+")
+_YT_RE  = re.compile(
+    r"(?:https?://)?(?:www\.|m\.|music\.)?(?:youtube\.com|youtu\.be|yt\.be)(?:/[^\s]*)?",
+    re.IGNORECASE,
+)
+_YT_ID_RE = re.compile(
+    r"(?:v=|/v/|youtu\.be/|/embed/|/shorts/|/live/)([A-Za-z0-9_-]{11})"
+)
 
 
 def extract_url(text: str) -> str | None:
@@ -448,17 +359,13 @@ def extract_url(text: str) -> str | None:
     return m.group(0) if m else None
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  READABLE SIZES
-# ═══════════════════════════════════════════════════════════════════════════════
-def readable_size(b: int | float | None) -> str:
-    if not b:
-        return ""
-    for unit in ("B", "KB", "MB", "GB"):
-        if b < 1024:
-            return f"  (~{b:.0f} {unit})"
-        b /= 1024
-    return f"  (~{b:.2f} TB)"
+def _is_youtube_url(url: str) -> bool:
+    return bool(_YT_RE.match(url))
+
+
+def _extract_youtube_id(url: str) -> str | None:
+    m = _YT_ID_RE.search(url)
+    return m.group(1) if m else None
 
 
 def readable_bytes(b: int | float) -> str:
@@ -469,470 +376,169 @@ def readable_bytes(b: int | float) -> str:
     return f"{b:.2f} TB"
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  FORMAT FETCHING  (yt-dlp Python API, run in executor)
-# ═══════════════════════════════════════════════════════════════════════════════
-# ── YouTube URL detection ──────────────────────────────────────────────────────
-_YT_RE = re.compile(
-    r"(?:https?://)?(?:www\.|m\.|music\.)?(?:youtube\.com|youtu\.be|yt\.be)"
-    r"(?:/[^\s]*)?",
-    re.IGNORECASE,
-)
-
-def _is_youtube_url(url: str) -> bool:
-    return bool(_YT_RE.match(url))
-
-
-def _build_ydl_opts(for_info: bool = False) -> dict:
-    """
-    Build yt-dlp options.
-
-    KEY CHANGE (v5.0): Use 'ios' and 'tv_embedded' player clients as primary.
-    These bypass YouTube's bot-detection / PO-token requirement entirely —
-    no cookies, no OAuth needed for public content.  Cookies are still applied
-    when available to unlock age-restricted / members-only videos.
-
-    for_info=True  → lightweight metadata-only fetch (no playlist expansion).
-    for_info=False → full download options.
-    """
-    opts: dict = {
-        "quiet": True,
-        "no_warnings": True,
-        "noprogress": True,
-        "socket_timeout": config.INFO_TIMEOUT,
-        "usenetrc": True,
-        "allow_multiple_video_streams": True,
-        "allow_multiple_audio_streams": True,
-        "retries": 10,
-        "fragment_retries": 10,
-        "retry_sleep_functions": {
-            "http":        lambda n: 3,
-            "fragment":    lambda n: 3,
-            "file_access": lambda n: 3,
-            "extractor":   lambda n: 3,
-        },
-        # PRIMARY FIX: ios + tv_embedded clients bypass bot-detection completely.
-        # No PO token, no cookies required for public YouTube videos.
-        # Fallback chain: ios → tv_embedded → mweb → web
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["ios", "tv_embedded", "mweb", "web"],
-            }
-        },
-    }
-    if for_info:
-        # WZML-X fix: fetch only first item metadata — avoids playlist expansion.
-        opts["playlist_items"] = "0"
-
-    if _cookies_path and _cookies_path.exists():
-        opts["cookiefile"] = str(_cookies_path)
-        logger.info("Using cookies file: %s", _cookies_path)
-    else:
-        logger.info("No cookies — public content only.")
-
-    return opts
-
-
-def _fetch_formats_sync(url: str) -> tuple:
-    """
-    Blocking. Returns (title, thumbnail_url, formats_list, error_str).
-    error_str is non-empty when yt-dlp raised an exception.
-
-    Format parsing follows the WZML-X (wzv3) approach:
-    - Filter by tbr (total bitrate) to skip zero/invalid streams.
-    - Use video_ext / height / acodec to classify video vs audio streams.
-    - Build proper yt-dlp format selectors.
-    """
-    import yt_dlp
-
-    error_str = ""
-    info = None
-    try:
-        with yt_dlp.YoutubeDL(_build_ydl_opts(for_info=True)) as ydl:
-            info = ydl.extract_info(url, download=False)
-    except yt_dlp.utils.DownloadError as e:
-        error_str = str(e).replace("<", " ").replace(">", " ")
-        logger.warning("_fetch_formats_sync DownloadError: %s", error_str)
-    except Exception as e:
-        error_str = str(e)
-        logger.warning("_fetch_formats_sync error: %s", error_str)
-
-    if info is None:
-        return None, None, [], error_str
-
-    title     = info.get("title", "Unknown")
-    thumbnail = info.get("thumbnail")
-
-    # ── Video format parsing (WZML-X tbr-based approach) ──────────────────────
-    # Key insight from WZML-X: only process formats that have a valid tbr
-    # (total bitrate). Formats with tbr=0 or None are incomplete/invalid.
-    _is_m4a = False
-
-    # b_name (e.g. "1080p30") → tbr_str → [filesize, ytdl_fmt, height, fps]
-    fmt_dict: dict[str, dict] = {}
-
-    for item in info.get("formats") or []:
-        if not item.get("tbr"):
-            continue  # skip zero/None bitrate formats (WZML-X fix)
-
-        format_id = item["format_id"]
-        size = item.get("filesize") or item.get("filesize_approx") or 0
-
-        # Detect m4a audio stream (affects format selector for mp4 video)
-        if item.get("video_ext") == "none" and (
-            item.get("resolution") == "audio only"
-            or item.get("acodec") not in (None, "none", "")
-        ):
-            if item.get("audio_ext") == "m4a":
-                _is_m4a = True
-            # Audio-only streams are not added as standalone video options
-            continue
-
-        if not item.get("height"):
-            continue  # skip formats without resolution (e.g. storyboards)
-
-        height = int(item["height"])
-        ext    = item.get("ext", "mp4")
-        fps    = item.get("fps") or ""
-
-        # Build a yt-dlp format selector: video stream + best audio
-        # (WZML-X: ba[ext=m4a] when m4a audio is available + video is mp4)
-        ba_ext   = "[ext=m4a]" if _is_m4a and ext == "mp4" else ""
-        ytdl_fmt = f"{format_id}+ba{ba_ext}/b[height=?{height}]"
-
-        fps_label = f"{int(fps)}" if fps else ""
-        b_name    = f"{height}p{fps_label}"
-        tbr_str   = str(item["tbr"])
-
-        fmt_dict.setdefault(b_name, {})[tbr_str] = [size, ytdl_fmt, height, fps]
-
-    # Build the final formats list sorted by height descending
-    formats: list[dict] = []
-    def _height_of(key: str) -> int:
-        try:
-            return int(key.rstrip("p0123456789").rstrip("p") or key.split("p")[0])
-        except Exception:
-            return 0
-
-    for b_name in sorted(fmt_dict.keys(),
-                         key=lambda k: int(k.split("p")[0]) if k.split("p")[0].isdigit() else 0,
-                         reverse=True):
-        tbr_dict = fmt_dict[b_name]
-
-        # Pick the entry with the highest bitrate (best quality for that resolution)
-        best_tbr = max(tbr_dict.keys(), key=lambda x: float(x))
-        size, ytdl_fmt, height, fps = tbr_dict[best_tbr]
-
-        emoji    = config.QUALITY_EMOJI.get(height, "🎥")
-        tag      = config.HD_LABEL.get(height, "")
-        fps_str  = f" {int(fps)}fps" if fps else ""
-        size_str = readable_size(size)
-
-        formats.append({
-            "label":    f"{emoji}  {height}p{tag}{fps_str}{size_str}",
-            "ytdl_fmt": ytdl_fmt,
-            "is_audio": False,
-            "height":   height,
-        })
-
-    # ── Audio-only formats ────────────────────────────────────────────────────
-    for label, aud_fmt, aud_qual in [
-        ("🎵  MP3  320 Kbps",    "mp3",  "0"),
-        ("🎵  MP3  128 Kbps",    "mp3",  "5"),
-        ("🔊  AAC",              "aac",  "0"),
-        ("🔊  FLAC  (lossless)", "flac", "0"),
-        ("🔊  Opus",             "opus", "0"),
-        ("🔊  WAV",              "wav",  "0"),
-    ]:
-        formats.append({
-            "label":      label,
-            "ytdl_fmt":   "bestaudio/best",
-            "is_audio":   True,
-            "audio_fmt":  aud_fmt,
-            "audio_qual": aud_qual,
-        })
-
-    return title, thumbnail, formats, error_str
+def _upload_text(fmt_label: str, current: int, total: int) -> str:
+    pct = (current / total * 100) if total else 0
+    filled = min(int(pct / 10), 10)
+    bar = "█" * filled + "░" * (10 - filled)
+    return (
+        f"📤 Uploading…\n\n"
+        f"📌 *{fmt_label}*\n\n"
+        f"`[{bar}] {pct:.1f}%`\n\n"
+        f"`{readable_bytes(current)} / {readable_bytes(total)}`"
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  YOUTUBE FREE-API FALLBACK  (Invidious → Piped, no cookies / auth needed)
+#  YTDOWN.TO API  — YouTube download (y2mate-compatible, no auth, no cookies)
 # ═══════════════════════════════════════════════════════════════════════════════
-# Two community-run YouTube frontends with public JSON APIs.
-# Both use their own server IPs → no Heroku datacenter bot-detection.
+# ytdown.to uses the exact same /en27/ API path as y2mate — it is a y2mate
+# variant. Their servers process the YouTube URL themselves — Heroku's IP
+# block on YouTube does NOT affect this approach.
 #
-# Fallback chain:
-#   1. Invidious  — /api/v1/videos/{id}  → adaptiveFormats (itag-based)
-#   2. Piped      — /streams/{id}        → videoStreams/audioStreams (quality-based)
-#
-# Stream URLs expire, so we NEVER store them. We store (video_id + itag OR
-# quality+codec) and re-fetch a fresh URL at actual download time.
+# Flow:
+#   1. POST /en27/analyze/ajax  → get (vid, title, quality_map)
+#   2. User picks quality       → bot stores (ytdown_vid, ytdown_k)
+#   3. At download time: POST /en27/convert/ajax  → direct CDN link
+#   4. Stream-download CDN link → upload to Telegram
 
-# ── Invidious instances (checked 2026-05) ─────────────────────────────────────
-_INVIDIOUS_INSTANCES = [
-    "https://inv.nadeko.net",        # CL — usually reachable from Heroku
-    "https://yewtu.be",              # NL — popular, stable
-    "https://invidious.io.lol",      # Cloudflare-proxied, very reliable
-    "https://invidious.jing.rocks",  # US
-    "https://vid.priv.au",           # AU
-    "https://invidious.nerdvpn.de",  # DE
-    "https://invidious.asir.dev",    # ES
+_YTDOWN_MIRRORS = [
+    "https://app.ytdown.to",
+    "https://www.y2mate.com/mates",
+    "https://y2mate.guru",
+    "https://www.yt5s.io",
 ]
-
-# ── Piped instances ────────────────────────────────────────────────────────────
-_PIPED_INSTANCES = [
-    "https://pipedapi.kavin.rocks",          # primary (Kavin's official)
-    "https://pipedapi.adminforge.de",        # DE mirror
-    "https://piped-api.garudalinux.org",     # IN/EU
-    "https://pipedapi.tokhmi.xyz",           # US
-    "https://piped.smnz.de",                # DE
-]
-
-_YT_FREE_TIMEOUT = aiohttp.ClientTimeout(total=15)
-
-_YT_ID_RE = re.compile(
-    r"(?:youtube\.com/(?:watch\?(?:.*&)?v=|embed/|v/|shorts/)|youtu\.be/)"
-    r"([A-Za-z0-9_-]{11})"
-)
-
-_QEMOJI: dict[str, str] = {
-    "2160p": "🎥", "1440p": "🎬", "1080p": "🎬",
-    "720p":  "📺", "480p":  "📱", "360p":  "📱",
-    "240p":  "🔅", "144p":  "🔅",
+_YTDOWN_HDRS = {
+    "Accept":           "*/*",
+    "Content-Type":     "application/x-www-form-urlencoded; charset=UTF-8",
+    "User-Agent":       (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "X-Requested-With": "XMLHttpRequest",
 }
+_YTDOWN_TIMEOUT = aiohttp.ClientTimeout(total=30)
 
 
-def _extract_youtube_id(url: str) -> str | None:
-    """Extract YouTube video ID from any YouTube URL format."""
-    m = _YT_ID_RE.search(url)
-    return m.group(1) if m else None
-
-
-# ── Invidious helpers ──────────────────────────────────────────────────────────
-
-async def _invidious_api_get(path: str) -> dict | None:
-    """Try each Invidious instance until one returns HTTP 200 JSON."""
-    for instance in _INVIDIOUS_INSTANCES:
+async def _ytdown_analyze(yt_url: str) -> tuple[str | None, str | None, str | None, dict]:
+    """
+    Try each ytdown mirror until one returns a successful analyze response.
+    Returns (vid, title, thumbnail_url, info_dict) or (None,...) on all failures.
+    info_dict: {"mp4": {"1080": {"k": "...", "q_text": "...", "size": "..."}}, "mp3": {...}}
+    """
+    for mirror in _YTDOWN_MIRRORS:
+        analyze_url = f"{mirror}/en27/analyze/ajax"
+        hdrs = {**_YTDOWN_HDRS, "Origin": mirror, "Referer": f"{mirror}/en27/"}
         try:
-            async with aiohttp.ClientSession(timeout=_YT_FREE_TIMEOUT) as sess:
-                async with sess.get(f"{instance}{path}") as resp:
-                    if resp.status == 200:
-                        return await resp.json(content_type=None)
+            async with aiohttp.ClientSession(headers=hdrs, timeout=_YTDOWN_TIMEOUT) as sess:
+                async with sess.post(
+                    analyze_url,
+                    data={"url": yt_url, "q_auto": 0, "ajax": 1},
+                ) as resp:
+                    if resp.status != 200:
+                        logger.warning("ytdown %s analyze HTTP %s", mirror, resp.status)
+                        continue
+                    data = await resp.json(content_type=None)
         except Exception as e:
-            logger.warning("Invidious %s failed: %s", instance, e)
-    return None
-
-
-def _parse_invidious_formats(raw_formats: list, video_id: str) -> list[dict]:
-    """Convert Invidious adaptiveFormats → internal format dicts."""
-    seen_video: set[str] = set()
-    seen_audio: set[str] = set()
-    fmts: list[dict]     = []
-
-    def _vres(f: dict) -> int:
-        try:
-            return int(f.get("resolution", "0x0").split("x")[-1])
-        except Exception:
-            return 0
-
-    video_raw = sorted(
-        [f for f in raw_formats if f.get("type", "").startswith("video/") and f.get("qualityLabel")],
-        key=_vres, reverse=True,
-    )
-    for f in video_raw:
-        qlabel = f.get("qualityLabel", "")
-        codec  = "mp4" if "mp4" in f.get("type", "") else "webm"
-        key    = f"{qlabel}_{codec}"
-        if key in seen_video:
+            logger.warning("ytdown %s analyze error: %s", mirror, e)
             continue
-        seen_video.add(key)
+
+        if str(data.get("status", "")).lower() not in ("ok", "1", "true"):
+            logger.warning("ytdown %s status not ok: %s", mirror, data.get("status"))
+            continue
+
+        vid   = data.get("vid") or data.get("id")
+        title = data.get("title")
+        thumb = (
+            data.get("thumbnail") or data.get("thumb")
+            or (f"https://img.youtube.com/vi/{vid}/hqdefault.jpg" if vid else None)
+        )
+        info  = data.get("info") or data.get("links") or {}
+        if vid and info:
+            logger.info("ytdown OK via %s for vid=%s", mirror, vid)
+            return vid, title, thumb, info
+
+    return None, None, None, {}
+
+
+async def _ytdown_get_link(vid: str, k: str) -> tuple[str | None, str]:
+    """
+    Call ytdown convert endpoint to get a direct CDN download URL.
+    Returns (download_url, error_string).
+    """
+    for mirror in _YTDOWN_MIRRORS:
+        convert_url = f"{mirror}/en27/convert/ajax"
+        hdrs = {**_YTDOWN_HDRS, "Origin": mirror, "Referer": f"{mirror}/en27/"}
+        try:
+            async with aiohttp.ClientSession(headers=hdrs, timeout=_YTDOWN_TIMEOUT) as sess:
+                async with sess.post(
+                    convert_url,
+                    data={"vid": vid, "k": k, "q_auto": 0, "ajax": 1},
+                ) as resp:
+                    if resp.status != 200:
+                        continue
+                    data = await resp.json(content_type=None)
+        except Exception as e:
+            logger.warning("ytdown %s convert error: %s", mirror, e)
+            continue
+
+        dl = (
+            data.get("dlink") or data.get("downloadUrl")
+            or data.get("url") or data.get("dl")
+        )
+        if dl:
+            return dl, ""
+
+    return None, "all ytdown mirrors failed for convert"
+
+
+def _parse_ytdown_formats(vid: str, info: dict) -> list[dict]:
+    """
+    Convert ytdown analyze info dict → internal format list.
+    info = {"mp4": {"1080": {k, q_text, size}, ...}, "mp3": {"128": {...}}}
+    """
+    _VE = {
+        "2160": "🎥", "1440": "🎬", "1080": "🎬", "720": "📺",
+        "480": "📱", "360": "📱", "240": "🔅", "144": "🔅",
+    }
+    fmts: list[dict] = []
+
+    mp4 = info.get("mp4") or info.get("video") or {}
+    for qual in sorted(mp4.keys(), key=lambda q: int(q) if q.isdigit() else 0, reverse=True):
+        val   = mp4[qual]
+        k     = val.get("k", "")
+        if not k:
+            continue
+        q_txt = val.get("q_text") or f"{qual}p (.mp4)"
+        size  = val.get("size", "")
+        emoji = _VE.get(qual, "🎬")
         fmts.append({
-            "label":              f"{_QEMOJI.get(qlabel, '🎬')}  {qlabel}  [{codec.upper()}]",
-            "is_audio":           False,
-            "invidious":          True,
-            "yt_api":             "invidious",
-            "invidious_video_id": video_id,
-            "invidious_itag":     str(f.get("itag", "")),
-            "invidious_ext":      codec,
+            "label":      f"{emoji}  {q_txt}" + (f"  [{size}]" if size else ""),
+            "is_audio":   False,
+            "ytdown_vid": vid,
+            "ytdown_k":   k,
+            "ytdown_ext": "mp4",
         })
 
-    audio_raw = sorted(
-        [f for f in raw_formats if f.get("type", "").startswith("audio/")],
-        key=lambda f: int(f.get("bitrate", 0)), reverse=True,
-    )
-    for f in audio_raw:
-        codec = "opus" if "opus" in f.get("type", "") else "m4a"
-        if codec in seen_audio:
+    mp3 = info.get("mp3") or info.get("audio") or {}
+    for qual in sorted(mp3.keys(), reverse=True):
+        val   = mp3[qual]
+        k     = val.get("k", "")
+        if not k:
             continue
-        seen_audio.add(codec)
+        q_txt = val.get("q_text") or f"{qual}kbps (.mp3)"
         fmts.append({
-            "label":              f"🎵  Audio — {'Opus (WebM)' if codec == 'opus' else 'M4A (AAC)'}",
-            "is_audio":           True,
-            "invidious":          True,
-            "yt_api":             "invidious",
-            "invidious_video_id": video_id,
-            "invidious_itag":     str(f.get("itag", "")),
-            "invidious_ext":      codec,
+            "label":      f"🎵  {q_txt}",
+            "is_audio":   True,
+            "ytdown_vid": vid,
+            "ytdown_k":   k,
+            "ytdown_ext": "mp3",
         })
 
     return fmts
 
 
-# ── Piped helpers ──────────────────────────────────────────────────────────────
-
-async def _piped_api_get(video_id: str) -> dict | None:
-    """Try each Piped instance until one returns HTTP 200 JSON for /streams/{id}."""
-    for instance in _PIPED_INSTANCES:
-        try:
-            async with aiohttp.ClientSession(timeout=_YT_FREE_TIMEOUT) as sess:
-                async with sess.get(f"{instance}/streams/{video_id}") as resp:
-                    if resp.status == 200:
-                        return await resp.json(content_type=None)
-        except Exception as e:
-            logger.warning("Piped %s failed: %s", instance, e)
-    return None
-
-
-def _parse_piped_formats(data: dict, video_id: str) -> list[dict]:
-    """Convert Piped /streams response → internal format dicts."""
-    seen_video: set[str] = set()
-    seen_audio: set[str] = set()
-    fmts: list[dict]     = []
-
-    video_streams = sorted(
-        [s for s in data.get("videoStreams", []) if s.get("quality")],
-        key=lambda s: int(s.get("height", 0) or 0), reverse=True,
-    )
-    for s in video_streams:
-        qlabel = s.get("quality", "")        # e.g. "1080p"
-        codec  = "mp4" if "mp4" in s.get("mimeType", "") else "webm"
-        key    = f"{qlabel}_{codec}"
-        if key in seen_video:
-            continue
-        seen_video.add(key)
-        fmts.append({
-            "label":              f"{_QEMOJI.get(qlabel, '🎬')}  {qlabel}  [{codec.upper()}]  ⚡Piped",
-            "is_audio":           False,
-            "invidious":          True,   # reuse routing key
-            "yt_api":             "piped",
-            "invidious_video_id": video_id,
-            "invidious_itag":     None,
-            "invidious_ext":      codec,
-            "piped_quality":      qlabel,
-            "piped_codec":        codec,
-        })
-
-    audio_streams = sorted(
-        data.get("audioStreams", []),
-        key=lambda s: int(s.get("bitrate", 0) or 0), reverse=True,
-    )
-    for s in audio_streams:
-        codec = "opus" if "opus" in s.get("mimeType", "") else "m4a"
-        if codec in seen_audio:
-            continue
-        seen_audio.add(codec)
-        fmts.append({
-            "label":              f"🎵  Audio — {'Opus (WebM)' if codec == 'opus' else 'M4A (AAC)'}  ⚡Piped",
-            "is_audio":           True,
-            "invidious":          True,
-            "yt_api":             "piped",
-            "invidious_video_id": video_id,
-            "invidious_itag":     None,
-            "invidious_ext":      codec,
-            "piped_quality":      s.get("quality", ""),
-            "piped_codec":        codec,
-        })
-
-    return fmts
-
-
-# ── Unified info fetch (Invidious → Piped) ────────────────────────────────────
-
-async def _invidious_fetch_info(video_id: str) -> tuple[str | None, str | None, list]:
-    """
-    Try Invidious first, then Piped.
-    Returns (title, thumbnail_url, format_list).
-    """
-    # ── Try Invidious ──────────────────────────────────────────────────────────
-    inv_data = await _invidious_api_get(
-        f"/api/v1/videos/{video_id}?fields=title,videoThumbnails,adaptiveFormats"
-    )
-    if inv_data and inv_data.get("adaptiveFormats"):
-        title  = inv_data.get("title")
-        thumbs = inv_data.get("videoThumbnails", [])
-        thumb  = next(
-            (t["url"] for q in ("maxresdefault","sddefault","high","medium","default")
-             for t in thumbs if t.get("quality") == q),
-            thumbs[0]["url"] if thumbs else None,
-        )
-        fmts = _parse_invidious_formats(inv_data["adaptiveFormats"], video_id)
-        if fmts:
-            logger.info("Invidious OK for video_id=%s (%d formats)", video_id, len(fmts))
-            return title, thumb, fmts
-
-    logger.warning("Invidious failed for video_id=%s, trying Piped…", video_id)
-
-    # ── Try Piped ─────────────────────────────────────────────────────────────
-    piped_data = await _piped_api_get(video_id)
-    if piped_data:
-        title = piped_data.get("title")
-        thumb = piped_data.get("thumbnailUrl")
-        fmts  = _parse_piped_formats(piped_data, video_id)
-        if fmts:
-            logger.info("Piped OK for video_id=%s (%d formats)", video_id, len(fmts))
-            return title, thumb, fmts
-
-    logger.error("Both Invidious and Piped failed for video_id=%s", video_id)
-    return None, None, []
-
-
-# ── Stream URL refresh at download time ───────────────────────────────────────
-
-async def _invidious_get_stream_url(fmt: dict) -> tuple[str | None, str]:
-    """
-    Re-fetch a FRESH stream URL at download time (URLs expire).
-    Dispatches to Invidious (by itag) or Piped (by quality+codec).
-    """
-    video_id = fmt["invidious_video_id"]
-
-    if fmt.get("yt_api") == "piped":
-        # Re-fetch from Piped and match by quality + codec
-        piped_data = await _piped_api_get(video_id)
-        if not piped_data:
-            return None, "All Piped instances failed"
-        is_audio = fmt["is_audio"]
-        target_q = fmt.get("piped_quality", "")
-        codec    = fmt.get("piped_codec", "")
-        streams  = piped_data.get("audioStreams" if is_audio else "videoStreams", [])
-        for s in streams:
-            s_codec = "opus" if "opus" in s.get("mimeType", "") else ("m4a" if is_audio else "mp4" if "mp4" in s.get("mimeType","") else "webm")
-            if is_audio:
-                if s_codec == codec:
-                    return s.get("url"), ""
-            else:
-                if s.get("quality") == target_q and s_codec == codec:
-                    return s.get("url"), ""
-        return None, f"Piped: stream not found (quality={target_q} codec={codec})"
-
-    else:
-        # Re-fetch from Invidious by itag
-        itag = fmt.get("invidious_itag", "")
-        data = await _invidious_api_get(
-            f"/api/v1/videos/{video_id}?fields=adaptiveFormats"
-        )
-        if not data:
-            return None, "All Invidious instances failed"
-        for f in data.get("adaptiveFormats", []):
-            if str(f.get("itag")) == str(itag):
-                url = f.get("url")
-                if url:
-                    return url, ""
-        return None, f"Invidious: itag {itag} not found"
-
-
-# ── Streaming download helper ──────────────────────────────────────────────────
-
-async def _invidious_download_file(
+async def _ytdown_download_file(
     fmt: dict,
     out_dir: str,
     url_hash: str,
@@ -941,26 +547,25 @@ async def _invidious_download_file(
     fmt_label: str,
 ) -> tuple[str | None, str]:
     """
-    Get a fresh stream URL from Invidious/Piped, then stream-download it.
+    1. Call ytdown convert API → get fresh CDN URL
+    2. Stream-download to disk with live progress
     Returns (filepath, "done"|"cancelled"|"error").
     """
     try:
         await status_msg.edit_text(
-            f"🔗 *Getting stream URL…*\n\n📌 *{fmt_label}*",
+            f"🔗 *Getting download link from ytdown.to…*\n\n📌 *{fmt_label}*",
             reply_markup=kb_cancel(url_hash),
         )
     except Exception:
         pass
 
-    stream_url, err = await _invidious_get_stream_url(fmt)
-    if not stream_url:
-        logger.error("Stream URL fetch failed: %s", err)
+    dl_url, err = await _ytdown_get_link(fmt["ytdown_vid"], fmt["ytdown_k"])
+    if not dl_url:
+        logger.error("ytdown get_link failed: %s", err)
         return None, "error"
 
-    video_id = fmt["invidious_video_id"]
-    itag     = fmt.get("invidious_itag") or fmt.get("piped_quality", "dl")
-    ext      = fmt.get("invidious_ext", "mp4")
-    filepath = os.path.join(out_dir, f"{video_id}_{itag}.{ext}")
+    ext      = fmt.get("ytdown_ext", "mp4")
+    filepath = os.path.join(out_dir, f"{fmt['ytdown_vid']}.{ext}")
     last_edit = 0.0
 
     async def _update(pct: float, speed_bps: float, total: int):
@@ -985,9 +590,9 @@ async def _invidious_download_file(
 
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=3600)) as sess:
-            async with sess.get(stream_url) as resp:
+            async with sess.get(dl_url) as resp:
                 if resp.status not in (200, 206):
-                    logger.error("Stream returned HTTP %s", resp.status)
+                    logger.error("ytdown CDN HTTP %s", resp.status)
                     return None, "error"
                 total      = int(resp.headers.get("Content-Length", 0))
                 downloaded = 0
@@ -1001,11 +606,10 @@ async def _invidious_download_file(
                         elapsed = asyncio.get_event_loop().time() - t0 or 0.001
                         pct     = (downloaded / total * 100) if total else 0
                         await _update(pct, downloaded / elapsed, total)
-
     except asyncio.CancelledError:
         return None, "cancelled"
     except Exception as e:
-        logger.error("Stream download error: %s", e)
+        logger.error("ytdown CDN download error: %s", e)
         return None, "error"
 
     if cancel_ev.is_set():
@@ -1014,212 +618,23 @@ async def _invidious_download_file(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  YT-DLP COMMAND BUILDER
-# ═══════════════════════════════════════════════════════════════════════════════
-def _build_cmd(url: str, fmt: dict, out_dir: str) -> list[str]:
-    tpl = os.path.join(out_dir, "%(title).80s.%(ext)s")
-    cmd = [
-        "yt-dlp",
-        "--no-playlist",
-        "--progress",
-        "--newline",
-        "--retries", "10",
-        "--fragment-retries", "10",
-        "--http-chunk-size", "1048576",
-        # YouTube: ios + tv_embedded bypass bot-detection without any auth/cookies
-        "--extractor-args", "youtube:player_client=ios,tv_embedded,mweb,web",
-        "-o", tpl,
-    ]
-    if _cookies_path and _cookies_path.exists():
-        cmd += ["--cookies", str(_cookies_path)]
-
-    if fmt["is_audio"]:
-        cmd += [
-            "-f", fmt["ytdl_fmt"],
-            "-x",
-            "--audio-format", fmt["audio_fmt"],
-            "--audio-quality", fmt["audio_qual"],
-        ]
-    else:
-        cmd += [
-            "-f", fmt["ytdl_fmt"],
-            "--merge-output-format", "mp4",
-        ]
-
-    cmd.append(url)
-    return cmd
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  PROGRESS BAR FORMATTER
-# ═══════════════════════════════════════════════════════════════════════════════
-def _progress_text(
-    fmt_label: str,
-    url_hash: str,
-    percent: str = "0%",
-    speed: str = "N/A",
-    eta: str = "N/A",
-    size: str = "?",
-    phase: str = "📥 Downloading",
-) -> str:
-    try:
-        pct_val = float(percent.rstrip("%"))
-    except ValueError:
-        pct_val = 0.0
-    filled = min(int(pct_val / 10), 10)
-    bar    = "█" * filled + "░" * (10 - filled)
-    return (
-        f"{phase}…\n\n"
-        f"📌 *{fmt_label}*\n\n"
-        f"`[{bar}] {percent}`\n\n"
-        f"📦 Size : `{size}`\n"
-        f"⚡ Speed: `{speed}`\n"
-        f"⏱ ETA  : `{eta}`"
-    )
-
-
-def _upload_text(fmt_label: str, current: int, total: int) -> str:
-    pct_val = (current / total * 100) if total else 0
-    filled  = min(int(pct_val / 10), 10)
-    bar     = "█" * filled + "░" * (10 - filled)
-    return (
-        f"📤 *Uploading…*\n\n"
-        f"📌 *{fmt_label}*\n\n"
-        f"`[{bar}] {pct_val:.1f}%`\n\n"
-        f"`{readable_bytes(current)} / {readable_bytes(total)}`"
-    )
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  ASYNC DOWNLOAD WITH LIVE PROGRESS + CANCEL
-# ═══════════════════════════════════════════════════════════════════════════════
-async def _run_download(
-    url: str,
-    fmt: dict,
-    out_dir: str,
-    url_hash: str,
-    cancel_ev: asyncio.Event,
-    status_msg,
-) -> tuple[str | None, str]:
-    """
-    Dispatcher: routes to Invidious downloader (YouTube fallback) or yt-dlp.
-    Returns (filepath, "done" | "cancelled" | "error").
-    """
-    fmt_label = fmt["label"]
-
-    # ── Invidious / Piped path (YouTube fallback — no cookies/auth needed) ──────
-    if fmt.get("invidious"):
-        return await _invidious_download_file(
-            fmt, out_dir, url_hash, cancel_ev, status_msg, fmt_label,
-        )
-
-    # ── yt-dlp subprocess path ────────────────────────────────────────────────
-    cmd = _build_cmd(url, fmt, out_dir)
-
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
-    except Exception as e:
-        logger.error("subprocess start error: %s", e)
-        return None, "error"
-
-    active_procs[url_hash] = proc
-
-    percent = "0%"
-    speed   = "N/A"
-    eta     = "N/A"
-    size    = "?"
-    phase   = "📥 Downloading"
-    last_edit = 0.0
-
-    async def _update():
-        nonlocal last_edit
-        now = asyncio.get_event_loop().time()
-        if now - last_edit < 4:
-            return
-        last_edit = now
-        text = _progress_text(fmt_label, url_hash, percent, speed, eta, size, phase)
-        try:
-            await status_msg.edit_text(text, reply_markup=kb_cancel(url_hash))
-        except Exception:
-            pass
-
-    # Read stdout until EOF or cancel
-    try:
-        async for raw in proc.stdout:
-            if cancel_ev.is_set():
-                proc.kill()
-                await proc.wait()
-                active_procs.pop(url_hash, None)
-                return None, "cancelled"
-
-            line = raw.decode("utf-8", errors="ignore").strip()
-
-            m = _PROG_RE.match(line)
-            if m:
-                percent = m.group(1).strip() + "%"
-                size    = m.group(2).strip()
-                speed   = m.group(3).strip()
-                eta     = m.group(4).strip()
-                phase   = "📥 Downloading"
-                await _update()
-            elif "[Merger]" in line:
-                phase   = "🔀 Merging"
-                percent = "100%"
-                eta     = "0:00"
-                await _update()
-            elif "[ExtractAudio]" in line:
-                phase   = "🎵 Extracting Audio"
-                percent = "100%"
-                eta     = "0:00"
-                await _update()
-            elif "[ffmpeg]" in line:
-                phase   = "⚙️ Processing"
-                await _update()
-
-    except asyncio.CancelledError:
-        proc.kill()
-        await proc.wait()
-        return None, "cancelled"
-
-    await proc.wait()
-    active_procs.pop(url_hash, None)
-
-    if cancel_ev.is_set():
-        return None, "cancelled"
-    if proc.returncode != 0:
-        return None, "error"
-
-    # Find downloaded file (skip temp/partial files)
-    files = [
-        f for f in os.listdir(out_dir)
-        if not f.endswith((".part", ".ytdl", ".tmp"))
-    ]
-    if not files:
-        return None, "error"
-
-    return os.path.join(out_dir, files[0]), "done"
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  /start
+#  COMMAND HANDLERS
 # ═══════════════════════════════════════════════════════════════════════════════
 @app.on_message(filters.command("start") & filters.private)
 async def cmd_start(_, msg: Message):
     user = msg.from_user
-    await db_upsert_user(user.id, user.first_name, user.username)
-    sub = await check_sub(user.id)
+    sub  = await check_sub(user.id)
     if not sub["ok"]:
-        await send_menu(
-            None, chat_id=user.id,
-            thumb=config.THUMB_WELCOME,
-            text=cap_welcome(user.first_name),
-            keyboard=kb_join(sub),
+        await app.send_photo(
+            user.id,
+            photo=config.THUMB_WELCOME,
+            caption=cap_welcome(user.first_name),
+            reply_markup=kb_join(sub),
+        ) if config.THUMB_WELCOME else await app.send_message(
+            user.id, cap_welcome(user.first_name), reply_markup=kb_join(sub)
         )
         return
+    await db_upsert_user(user.id, user.first_name, user.username)
     await send_menu(
         None, chat_id=user.id,
         thumb=config.THUMB_HOME,
@@ -1228,272 +643,190 @@ async def cmd_start(_, msg: Message):
     )
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  /setthumb  /delthumb
-# ═══════════════════════════════════════════════════════════════════════════════
 @app.on_message(filters.command("setthumb") & filters.private)
 async def cmd_setthumb(_, msg: Message):
     user = msg.from_user
     sub  = await check_sub(user.id)
     if not sub["ok"]:
+        await msg.reply("❌ Join required channels first. Send /start.")
         return
     thumb_waiting.add(user.id)
     await msg.reply(
-        "🖼️ *Set Your Thumbnail*\n\n"
-        "Now send me the photo you want to use as your download thumbnail.\n\n"
+        "🖼️ *Send your thumbnail photo now.*\n\n"
+        "Any photo you send next will be saved as your thumbnail.\n"
         "_Send /cancel to abort._"
     )
 
 
 @app.on_message(filters.command("delthumb") & filters.private)
 async def cmd_delthumb(_, msg: Message):
-    await db_set_thumb(msg.from_user.id, None)
-    await msg.reply("🗑️ *Thumbnail removed.* Your downloads will use the default thumbnail.")
+    user = msg.from_user
+    await db_set_thumb(user.id, None)
+    await msg.reply("🗑️ *Thumbnail removed!*")
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  /setcookies  /delcookies  (admin only)
-# ═══════════════════════════════════════════════════════════════════════════════
-@app.on_message(filters.command("setcookies") & filters.private)
-async def cmd_setcookies(_, msg: Message):
-    if msg.from_user.id not in config.ADMIN_IDS:
-        await msg.reply("⛔ *Admin only.*")
-        return
-    status = "✅ Active" if _cookies_path and _cookies_path.exists() else "❌ Not set"
-    await msg.reply(
-        "🍪 *Cookies Setup*\n\n"
-        f"Current status: {status}\n\n"
-        "📎 *How to set cookies:*\n\n"
-        "1. Export `cookies.txt` from your browser using the\n"
-        "   *Get cookies.txt LOCALLY* extension\n"
-        "2. **Just send the `.txt` file here** — the bot will\n"
-        "   automatically detect it and ask for confirmation\n"
-        "3. Tap ✅ *Yes, Use It* — done!\n\n"
-        "💾 Cookies are saved to MongoDB and survive bot restarts.\n"
-        "🗑 Use /delcookies to remove them at any time."
-    )
-
-
-@app.on_message(filters.command("delcookies") & filters.private)
-async def cmd_delcookies(_, msg: Message):
-    global _cookies_path
-    if msg.from_user.id not in config.ADMIN_IDS:
-        await msg.reply("⛔ *Admin only.*")
-        return
-    _cookies_path = None
-    for p in (Path("cookies.txt"), _RUNTIME_COOKIES):
-        if p.exists():
-            p.unlink()
-    await db_delete_cookies()
-    await msg.reply(
-        "✅ *Cookies removed.*\n\n"
-        "🗑 Deleted from both local storage and MongoDB.\n"
-        "Bot will only access public content from now on."
-    )
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  /broadcast  (admin only)
-# ═══════════════════════════════════════════════════════════════════════════════
-@app.on_message(filters.command("broadcast") & filters.private)
-async def cmd_broadcast(_, msg: Message):
-    if msg.from_user.id not in config.ADMIN_IDS:
-        await msg.reply("⛔ *Admin only.*")
-        return
-    total = await db_count_users()
-    broadcast_waiting.add(msg.from_user.id)
-    await msg.reply(
-        f"📣 *Broadcast Mode*\n\n"
-        f"👥 Total users: *{total}*\n\n"
-        "Send me the message you want to broadcast.\n"
-        "Supported: text, photo with caption, video with caption, document.\n\n"
-        "_Send /cancel to abort._"
-    )
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  /cancel
-# ═══════════════════════════════════════════════════════════════════════════════
 @app.on_message(filters.command("cancel") & filters.private)
 async def cmd_cancel(_, msg: Message):
     user = msg.from_user
     thumb_waiting.discard(user.id)
     broadcast_waiting.discard(user.id)
     broadcast_pending.pop(user.id, None)
-    await msg.reply("❌ Cancelled.")
+    await msg.reply("❌ *Cancelled.*")
+
+
+@app.on_message(filters.command("broadcast") & filters.private)
+async def cmd_broadcast(_, msg: Message):
+    if msg.from_user.id not in config.ADMIN_IDS:
+        await msg.reply("⛔ Admin only.")
+        return
+    broadcast_waiting.add(msg.from_user.id)
+    await msg.reply(
+        "📣 *Broadcast mode.*\n\n"
+        "Send me the message (text, photo, video, or document) you want to broadcast.\n"
+        "_/cancel to abort._"
+    )
+
+
+@app.on_message(filters.command("stats") & filters.private)
+async def cmd_stats(_, msg: Message):
+    if msg.from_user.id not in config.ADMIN_IDS:
+        await msg.reply("⛔ Admin only.")
+        return
+    count = await db_count_users()
+    await msg.reply(f"👥 *Total users:* `{count}`")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  GENERAL MESSAGE HANDLER
+#  MESSAGE HANDLER  (URLs + photos + broadcast capture)
 # ═══════════════════════════════════════════════════════════════════════════════
-@app.on_message(filters.private & ~filters.command(""))
+@app.on_message(filters.private & ~filters.command(["start","setthumb","delthumb","cancel","broadcast","stats"]))
 async def on_message(_, msg: Message):
     user = msg.from_user
 
-    # ── Admin sends cookies file directly (auto-detect) ──────────────────────
-    if msg.document and user.id in config.ADMIN_IDS:
-        doc = msg.document
-        fname = (doc.file_name or "").lower()
-        mime  = (doc.mime_type or "").lower()
-        is_txt = fname.endswith(".txt") or "text" in mime or "netscape" in fname
-        if is_txt:
-            cookies_doc_pending[user.id] = msg
-            size_kb = round(doc.file_size / 1024, 1) if doc.file_size else "?"
-            await msg.reply(
-                "🍪 *Cookies File Detected!*\n\n"
-                f"📄 File: `{doc.file_name}`\n"
-                f"📦 Size: `{size_kb} KB`\n\n"
-                "Do you want to use this as the YouTube cookies file?\n"
-                "It will be saved to MongoDB and used immediately — *no restart needed*.",
-                reply_markup=InlineKeyboardMarkup([
-                    [
-                        InlineKeyboardButton("✅ Yes, Use It",  callback_data="ck_use"),
-                        InlineKeyboardButton("❌ Cancel",       callback_data="ck_cancel"),
-                    ]
-                ]),
-            )
-            return
-
-    # ── Broadcast message capture (admin) ────────────────────────────────────
+    # ── Broadcast capture ─────────────────────────────────────────────────────
     if user.id in broadcast_waiting:
         broadcast_waiting.discard(user.id)
         broadcast_pending[user.id] = msg
-        total = await db_count_users()
         await msg.reply(
-            f"📣 *Ready to Broadcast*\n\n"
-            f"👥 This will be sent to *{total}* users.\n\n"
-            "⚠️ Are you sure you want to send this message to everyone?",
+            "📣 *Ready to broadcast this message to all users.*\n\n"
+            "Confirm?",
             reply_markup=InlineKeyboardMarkup([
                 [
-                    InlineKeyboardButton("✅ Yes, Send Now", callback_data="bc_confirm"),
-                    InlineKeyboardButton("❌ Cancel",        callback_data="bc_cancel"),
+                    InlineKeyboardButton("✅ Send", callback_data="bc_confirm"),
+                    InlineKeyboardButton("❌ Cancel", callback_data="bc_cancel"),
                 ]
             ]),
         )
         return
 
-    # ── Thumbnail photo waiting ───────────────────────────────────────────────
-    if msg.photo and user.id in thumb_waiting:
+    # ── Thumbnail capture ─────────────────────────────────────────────────────
+    if user.id in thumb_waiting and msg.photo:
         thumb_waiting.discard(user.id)
         file_id = msg.photo.file_id
         await db_set_thumb(user.id, file_id)
         await msg.reply(
             "✅ *Thumbnail saved!*\n\n"
-            "It will appear on all your future video downloads.\n"
-            "_Use /delthumb to remove it._"
+            "It will appear on all your future downloads.\n"
+            "_Tap *My Thumbnail* → *Remove* to delete it._"
         )
         return
 
-    if not msg.text:
-        return
-
-    text = msg.text.strip()
-
-    # ── Subscription gate ─────────────────────────────────────────────────────
+    # ── Auth gate ─────────────────────────────────────────────────────────────
     sub = await check_sub(user.id)
     if not sub["ok"]:
-        await send_menu(
-            None, chat_id=user.id,
-            thumb=config.THUMB_WELCOME,
-            text=cap_welcome(user.first_name),
-            keyboard=kb_join(sub),
+        await app.send_message(
+            user.id,
+            "❌ *You must join both channels first.*",
+            reply_markup=kb_join(sub),
         )
         return
 
     # ── URL detection ─────────────────────────────────────────────────────────
-    url = extract_url(text)
-    if not url:
-        await send_menu(
-            None, chat_id=user.id,
-            thumb=config.THUMB_HOME,
-            text=(
-                "🔗 *Send a media link to download!*\n\n"
-                "Supports YouTube, Instagram, TikTok, Twitter, and 1500+ sites.\n\n"
-                + cap_home(user.first_name)
-            ),
-            keyboard=kb_home(),
-        )
+    text = msg.text or msg.caption or ""
+    url  = extract_url(text)
+    if url:
+        await db_upsert_user(user.id, user.first_name, user.username)
+        await handle_url(msg, user, url)
         return
 
-    await handle_url(msg, user, url)
-
-
-async def handle_url(msg: Message, user, url: str):
-    status = await msg.reply("🔍 *Fetching media info…*\nHang tight ⏳")
-
-    loop = asyncio.get_event_loop()
-    title, thumb, formats, fetch_error = await loop.run_in_executor(
-        None, _fetch_formats_sync, url
+    # ── Fallthrough ───────────────────────────────────────────────────────────
+    await msg.reply(
+        "🔗 *Send a YouTube link to download.*\n\n"
+        "_Example: https://youtube.com/watch?v=..._"
     )
 
-    # ── Invidious fallback for YouTube ────────────────────────────────────────
-    # When yt-dlp fails (Heroku IP bot-detected by YouTube), we fall back to
-    # Invidious — a community-run open-source YouTube frontend with its own IPs.
-    # No cookies, no JWT, no auth ever needed. Permanent solution.
-    using_invidious = False
-    if not formats and _is_youtube_url(url):
-        video_id = _extract_youtube_id(url)
-        if video_id:
-            logger.info(
-                "yt-dlp failed for YouTube — trying Invidious fallback (video_id=%s)", video_id
-            )
-            try:
-                await status.edit_text(
-                    "⚙️ *yt-dlp blocked by YouTube…*\n"
-                    "🔄 Switching to *Invidious* (community servers — no bot detection!)\n"
-                    "_Fetching real quality options…_"
-                )
-            except Exception:
-                pass
 
-            inv_title, inv_thumb, inv_raw = await _invidious_fetch_info(video_id)
-            if inv_raw:
-                formats          = _parse_invidious_formats(inv_raw, video_id)
-                title            = inv_title or title or "YouTube Video"
-                thumb            = inv_thumb or thumb or config.THUMB_DEFAULT
-                using_invidious  = True
-            else:
-                logger.warning("Invidious also failed for video_id=%s", video_id)
-
-    if not formats:
-        err_detail = ""
-        if fetch_error:
-            snippet = fetch_error[:300].strip()
-            err_detail = f"\n\n⚠️ *Error details:*\n`{snippet}`"
-        await status.edit_text(
-            "❌ *Could not fetch media info!*\n\n"
-            "• Check that the link is valid and publicly accessible\n"
-            "• Age-restricted / members-only content requires fresh cookies (ask the admin)\n"
-            "• YouTube may be blocking the request — try again in a few seconds"
-            + err_detail
+# ═══════════════════════════════════════════════════════════════════════════════
+#  URL HANDLER — ytdown.to only
+# ═══════════════════════════════════════════════════════════════════════════════
+async def handle_url(msg: Message, user, url: str):
+    if not _is_youtube_url(url):
+        await msg.reply(
+            "⚠️ *Only YouTube links are supported.*\n\n"
+            "Send a youtube.com or youtu.be link."
         )
         return
+
+    status = await msg.reply(
+        "🔍 *Fetching video info from ytdown.to…*\n"
+        "_Please wait…_"
+    )
+
+    vid, title, thumb, info = await _ytdown_analyze(url)
+
+    if not vid or not info:
+        try:
+            await status.edit_text(
+                "❌ *Could not fetch video info!*\n\n"
+                "• Make sure the link is a valid public YouTube video\n"
+                "• Age-restricted or members-only videos are not supported\n"
+                "• Try again in a few seconds"
+            )
+        except Exception:
+            pass
+        return
+
+    formats = _parse_ytdown_formats(vid, info)
+    if not formats:
+        try:
+            await status.edit_text(
+                "❌ *No downloadable formats found for this video.*\n\n"
+                "The video might be restricted. Try a different link."
+            )
+        except Exception:
+            pass
+        return
+
+    title = title or "YouTube Video"
+    thumb = thumb or config.THUMB_DEFAULT
 
     url_hash = hashlib.md5(url.encode()).hexdigest()[:12]
     pending[url_hash] = {
         "url":     url,
         "title":   title,
-        "thumb":   thumb or config.THUMB_DEFAULT,
+        "thumb":   thumb,
         "formats": formats,
     }
 
     short = title[:60] + ("…" if len(title) > 60 else "")
-    inv_note = "\n_⚡ Via Invidious — no cookies needed_" if using_invidious else ""
-    cap = (
+    cap   = (
         f"🎬 *{short}*\n\n"
         f"📊 *Choose your quality:*\n"
-        f"_({len(formats)} options — tap to start downloading)_"
-        + inv_note
+        f"_({len(formats)} options — tap to start downloading)_\n"
+        f"_⚡ Via ytdown.to — no bot detection_"
     )
 
     await status.delete()
-    video_thumb = thumb or config.THUMB_DEFAULT
-    if video_thumb:
-        await app.send_photo(user.id, photo=video_thumb, caption=cap,
-                             reply_markup=kb_qualities(url_hash, formats))
+    if thumb:
+        await app.send_photo(
+            user.id, photo=thumb, caption=cap,
+            reply_markup=kb_qualities(url_hash, formats),
+        )
     else:
-        await app.send_message(user.id, cap,
-                               reply_markup=kb_qualities(url_hash, formats))
+        await app.send_message(
+            user.id, cap,
+            reply_markup=kb_qualities(url_hash, formats),
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1518,9 +851,7 @@ async def on_callback(_, query: CallbackQuery):
                 is_edit=True,
             )
         else:
-            await query.answer(
-                "⚠️  Please join BOTH channels first!", show_alert=True
-            )
+            await query.answer("⚠️  Please join BOTH channels first!", show_alert=True)
         return
 
     # ── Navigation ────────────────────────────────────────────────────────────
@@ -1571,48 +902,6 @@ async def on_callback(_, query: CallbackQuery):
                         text=cap_home(user.first_name), keyboard=kb_home(), is_edit=True)
         return
 
-    # ── Cookies file confirm / cancel ────────────────────────────────────────
-    if data == "ck_cancel":
-        cookies_doc_pending.pop(user.id, None)
-        await query.answer("❌ Cancelled.", show_alert=False)
-        try:
-            await query.edit_message_text("❌ *Cookies file ignored.*")
-        except Exception:
-            pass
-        return
-
-    if data == "ck_use":
-        if user.id not in config.ADMIN_IDS:
-            await query.answer("⛔ Admin only.", show_alert=True)
-            return
-        doc_msg = cookies_doc_pending.pop(user.id, None)
-        if not doc_msg:
-            await query.answer("⚠️ File expired. Send it again.", show_alert=True)
-            return
-        await query.answer("⏳ Saving…", show_alert=False)
-        try:
-            await query.edit_message_text("⏳ *Downloading and saving cookies…*")
-        except Exception:
-            pass
-        global _cookies_path
-        try:
-            fp  = await doc_msg.download("cookies.txt")
-            raw = Path(fp).read_bytes()
-            _cookies_path = Path(fp)
-            await db_save_cookies(raw)
-            logger.info("Cookies saved via inline button: %s (%d bytes)", fp, len(raw))
-            await query.edit_message_text(
-                "✅ *Cookies activated!*\n\n"
-                f"📄 File: `{doc_msg.document.file_name}`\n"
-                "🍪 Now in use — **no restart needed**.\n"
-                "💾 Saved to MongoDB — survives restarts.\n\n"
-                "_Use /delcookies to remove them._"
-            )
-        except Exception as e:
-            logger.error("ck_use error: %s", e)
-            await query.edit_message_text(f"❌ *Failed to save cookies:*\n`{e}`")
-        return
-
     # ── Broadcast confirm / cancel ────────────────────────────────────────────
     if data == "bc_cancel":
         broadcast_pending.pop(user.id, None)
@@ -1644,7 +933,7 @@ async def on_callback(_, query: CallbackQuery):
                     )
                 except Exception:
                     pass
-            await asyncio.sleep(0.05)  # 20 msg/sec — stay under Telegram rate limit
+            await asyncio.sleep(0.05)
         try:
             await status.edit_text(
                 f"✅ *Broadcast Complete!*\n\n"
@@ -1659,9 +948,13 @@ async def on_callback(_, query: CallbackQuery):
     # ── Cancel quality picker ─────────────────────────────────────────────────
     if data == "cancel":
         try:
-            await query.edit_message_caption(caption="❌ *Cancelled.*\nSend a link anytime to start over.")
+            await query.edit_message_caption(
+                caption="❌ *Cancelled.*\nSend a YouTube link anytime to start over."
+            )
         except Exception:
-            await query.edit_message_text("❌ *Cancelled.*\nSend a link anytime to start over.")
+            await query.edit_message_text(
+                "❌ *Cancelled.*\nSend a YouTube link anytime to start over."
+            )
         return
 
     # ── Cancel active download ────────────────────────────────────────────────
@@ -1670,12 +963,6 @@ async def on_callback(_, query: CallbackQuery):
         ev = cancel_events.get(url_hash)
         if ev:
             ev.set()
-        proc = active_procs.get(url_hash)
-        if proc:
-            try:
-                proc.kill()
-            except Exception:
-                pass
         await query.answer("🛑 Cancelling…", show_alert=False)
         return
 
@@ -1692,9 +979,13 @@ async def on_callback(_, query: CallbackQuery):
 async def do_download(query: CallbackQuery, user, url_hash: str, fmt_idx: str):
     if url_hash not in pending:
         try:
-            await query.edit_message_caption(caption="⚠️ *Session expired.* Please send the link again.")
+            await query.edit_message_caption(
+                caption="⚠️ *Session expired.* Please send the link again."
+            )
         except Exception:
-            await query.edit_message_text("⚠️ *Session expired.* Please send the link again.")
+            await query.edit_message_text(
+                "⚠️ *Session expired.* Please send the link again."
+            )
         return
 
     session = pending[url_hash]
@@ -1709,16 +1000,14 @@ async def do_download(query: CallbackQuery, user, url_hash: str, fmt_idx: str):
 
     fmt_label = fmt["label"]
 
-    # Initial status message (replaces the quality picker photo)
-    initial_text = _progress_text(fmt_label, url_hash, "0%", "N/A", "N/A", "?", "📥 Starting")
     try:
         status_msg = await query.edit_message_caption(
-            caption=initial_text,
+            caption=f"🔗 *Getting download link…*\n\n📌 *{fmt_label}*",
             reply_markup=kb_cancel(url_hash),
         )
     except Exception:
         status_msg = await query.edit_message_text(
-            initial_text,
+            f"🔗 *Getting download link…*\n\n📌 *{fmt_label}*",
             reply_markup=kb_cancel(url_hash),
         )
 
@@ -1726,15 +1015,16 @@ async def do_download(query: CallbackQuery, user, url_hash: str, fmt_idx: str):
     cancel_events[url_hash] = cancel_ev
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        # ── Download ──────────────────────────────────────────────────────────
-        filepath, result = await _run_download(
-            session["url"], fmt, tmpdir, url_hash, cancel_ev, status_msg
+        filepath, result = await _ytdown_download_file(
+            fmt, tmpdir, url_hash, cancel_ev, status_msg, fmt_label
         )
         cancel_events.pop(url_hash, None)
 
         if result == "cancelled":
             try:
-                await status_msg.edit_text("🛑 *Download cancelled.*\nSend the link again anytime.")
+                await status_msg.edit_text(
+                    "🛑 *Download cancelled.*\nSend the link again anytime."
+                )
             except Exception:
                 pass
             return
@@ -1744,7 +1034,7 @@ async def do_download(query: CallbackQuery, user, url_hash: str, fmt_idx: str):
                 await status_msg.edit_text(
                     "❌ *Download failed!*\n\n"
                     "Try a different quality or resend the link.\n"
-                    "_(Restricted content needs cookies — ask admin)_"
+                    "_(The video might be restricted or unavailable.)_"
                 )
             except Exception:
                 pass
@@ -1787,20 +1077,10 @@ async def do_download(query: CallbackQuery, user, url_hash: str, fmt_idx: str):
         except Exception:
             pass
 
-        # Fetch user's custom thumbnail
-        user_thumb = await db_get_thumb(user.id)
-
-        file_caption = (
-            f"✅ *Done!*\n\n"
-            f"📌 {fmt_label}\n"
-            f"📦 {readable_bytes(filesize)}"
-        )
-
-        # Detect whether to send as audio or video.
-        # For cobalt downloads the file extension tells us the type.
-        _AUDIO_EXTS = {".mp3", ".aac", ".flac", ".opus", ".ogg", ".wav", ".m4a"}
-        file_ext    = os.path.splitext(filepath)[1].lower()
-        send_as_audio = fmt["is_audio"] or file_ext in _AUDIO_EXTS
+        user_thumb    = await db_get_thumb(user.id)
+        file_caption  = f"✅ *Done!*\n\n📌 {fmt_label}\n📦 {readable_bytes(filesize)}"
+        _AUDIO_EXTS   = {".mp3", ".aac", ".flac", ".opus", ".ogg", ".wav", ".m4a"}
+        send_as_audio = fmt["is_audio"] or os.path.splitext(filepath)[1].lower() in _AUDIO_EXTS
 
         try:
             if send_as_audio:
@@ -1822,7 +1102,6 @@ async def do_download(query: CallbackQuery, user, url_hash: str, fmt_idx: str):
                 )
         except Exception as e:
             logger.error("Upload error: %s", e)
-            # Final fallback: send as a plain document if video/audio send fails
             try:
                 await app.send_document(
                     user.id,
@@ -1842,7 +1121,6 @@ async def do_download(query: CallbackQuery, user, url_hash: str, fmt_idx: str):
                     pass
                 return
 
-    # Clean up
     pending.pop(url_hash, None)
     try:
         await status_msg.delete()
@@ -1861,9 +1139,8 @@ _BOT_COMMANDS = [
     BotCommand("setthumb",  "🖼️ Set your custom video thumbnail"),
     BotCommand("delthumb",  "🗑️ Remove your custom thumbnail"),
     BotCommand("cancel",    "❌ Cancel current action"),
-    BotCommand("setcookies","🍪 [Admin] Update cookies file (no restart needed)"),
-    BotCommand("delcookies","🗑️ [Admin] Remove cookies"),
     BotCommand("broadcast", "📣 [Admin] Send message to all users"),
+    BotCommand("stats",     "📊 [Admin] Total user count"),
 ]
 
 
@@ -1876,14 +1153,9 @@ async def _register_commands():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  HEROKU WEB DYNO KEEPALIVE  (prevents SIGKILL every 60s)
+#  HEROKU WEB DYNO KEEPALIVE
 # ═══════════════════════════════════════════════════════════════════════════════
 def _start_keepalive_server() -> None:
-    """
-    Heroku web dynos MUST bind to PORT within 60 s or the process is SIGKILL'd.
-    This minimal HTTP server satisfies that requirement without any extra deps.
-    The bot itself runs on MTProto (long-poll), so no real web server is needed.
-    """
     port = int(os.environ.get("PORT", 8080))
 
     class _Handler(http.server.BaseHTTPRequestHandler):
@@ -1896,7 +1168,7 @@ def _start_keepalive_server() -> None:
             self.wfile.write(body)
 
         def log_message(self, *_):
-            pass  # suppress default access log noise
+            pass
 
     server = http.server.HTTPServer(("0.0.0.0", port), _Handler)
     t = threading.Thread(target=server.serve_forever, daemon=True)
@@ -1905,63 +1177,21 @@ def _start_keepalive_server() -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  COOKIES — MONGODB RESTORE ON STARTUP
-# ═══════════════════════════════════════════════════════════════════════════════
-async def _restore_cookies_from_db() -> None:
-    """
-    Load cookies from MongoDB into a temp file.
-    Retries up to 3 times with a short delay to handle Atlas cold-start latency.
-    """
-    global _cookies_path
-    if _cookies_path is not None:
-        logger.info("Cookies already loaded from env/file — skipping DB restore.")
-        return
-    if _settings is None:
-        logger.info("MongoDB not configured — skipping cookie restore.")
-        return
-
-    for attempt in range(1, 4):
-        try:
-            raw = await db_load_cookies()
-            if raw:
-                _RUNTIME_COOKIES.write_bytes(raw)
-                _cookies_path = _RUNTIME_COOKIES
-                logger.info(
-                    "✅ Cookies restored from MongoDB (%d bytes) → %s",
-                    len(raw), _RUNTIME_COOKIES,
-                )
-                return
-            else:
-                logger.info(
-                    "No cookies in MongoDB (attempt %d/3) — waiting 3 s…", attempt
-                )
-                await asyncio.sleep(3)
-        except Exception as e:
-            logger.warning("Cookie restore attempt %d failed: %s", attempt, e)
-            await asyncio.sleep(3)
-
-    logger.info("No cookies found in MongoDB after 3 attempts — public content only.")
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
 #  ENTRY POINT
 # ═══════════════════════════════════════════════════════════════════════════════
 async def _main():
     from pyrogram.errors import FloodWait as _FloodWait
 
-    # Bind to PORT immediately — MUST happen before Heroku's 60-second timeout.
     _start_keepalive_server()
 
     retries = 0
     while True:
         try:
             async with app:
-                await _restore_cookies_from_db()
                 logger.info(
-                    "Bot v4.0 online | max_size=%s GB | mongo=%s | cookies=%s | session=%s",
+                    "Bot v6.0 online | max_size=%s GB | mongo=%s | session=%s",
                     config.MAX_FILE_SIZE // (1024**3),
                     "✓" if config.MONGO_URI else "✗",
-                    "✓" if _cookies_path is not None else "✗",
                     "string" if config.STRING_SESSION else "memory",
                 )
                 await _register_commands()
@@ -1971,8 +1201,7 @@ async def _main():
             wait = e.value + 5
             retries += 1
             logger.warning(
-                "FloodWait %ds from Telegram (attempt %d). Waiting before retry…",
-                wait, retries,
+                "FloodWait %ds from Telegram (attempt %d). Waiting…", wait, retries
             )
             await asyncio.sleep(wait)
         except Exception as e:
