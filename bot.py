@@ -59,8 +59,8 @@ app = Client(
 #  MONGODB
 # ═══════════════════════════════════════════════════════════════════════════════
 _mongo_client = AsyncIOMotorClient(config.MONGO_URI) if config.MONGO_URI else None
-_db           = _mongo_client[config.DB_NAME] if _mongo_client else None
-_users        = _db["users"] if _db else None
+_db           = _mongo_client[config.DB_NAME] if _mongo_client is not None else None
+_users        = _db["users"] if _db is not None else None
 
 
 async def db_upsert_user(user_id: int, first_name: str, username: str | None):
