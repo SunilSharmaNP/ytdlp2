@@ -1,5 +1,5 @@
 """
-YT-DLP Downloader Bot  v4.0
+YT-DLP Downloader Bot  v5.0
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━
 • All 1500+ yt-dlp sites supported
 • Live download + upload progress bar with Cancel button
@@ -10,6 +10,7 @@ YT-DLP Downloader Bot  v4.0
 • Admin broadcast (text / photo / video / document) to all users
 • Commands auto-registered on every startup
 • Up to 2 GB uploads via Pyrogram MTProto
+• YouTube: ios/tv_embedded player client (no bot-detection) + cobalt.tools fallback
 """
 
 import asyncio
@@ -24,6 +25,8 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+
+import aiohttp
 
 from motor.motor_asyncio import AsyncIOMotorClient
 from pyrogram import Client, filters
@@ -469,12 +472,28 @@ def readable_bytes(b: int | float) -> str:
 # ═══════════════════════════════════════════════════════════════════════════════
 #  FORMAT FETCHING  (yt-dlp Python API, run in executor)
 # ═══════════════════════════════════════════════════════════════════════════════
+# ── YouTube URL detection ──────────────────────────────────────────────────────
+_YT_RE = re.compile(
+    r"(?:https?://)?(?:www\.|m\.|music\.)?(?:youtube\.com|youtu\.be|yt\.be)"
+    r"(?:/[^\s]*)?",
+    re.IGNORECASE,
+)
+
+def _is_youtube_url(url: str) -> bool:
+    return bool(_YT_RE.match(url))
+
+
 def _build_ydl_opts(for_info: bool = False) -> dict:
     """
     Build yt-dlp options.
+
+    KEY CHANGE (v5.0): Use 'ios' and 'tv_embedded' player clients as primary.
+    These bypass YouTube's bot-detection / PO-token requirement entirely —
+    no cookies, no OAuth needed for public content.  Cookies are still applied
+    when available to unlock age-restricted / members-only videos.
+
     for_info=True  → lightweight metadata-only fetch (no playlist expansion).
     for_info=False → full download options.
-    Inspired by WZML-X (wzv3 branch) yt_dlp_download.py.
     """
     opts: dict = {
         "quiet": True,
@@ -482,10 +501,8 @@ def _build_ydl_opts(for_info: bool = False) -> dict:
         "noprogress": True,
         "socket_timeout": config.INFO_TIMEOUT,
         "usenetrc": True,
-        # Allow yt-dlp to pick the best combination of video+audio streams
         "allow_multiple_video_streams": True,
         "allow_multiple_audio_streams": True,
-        # Retry settings (WZML-X style)
         "retries": 10,
         "fragment_retries": 10,
         "retry_sleep_functions": {
@@ -494,23 +511,24 @@ def _build_ydl_opts(for_info: bool = False) -> dict:
             "file_access": lambda n: 3,
             "extractor":   lambda n: 3,
         },
-        # YouTube-specific: use web player client to avoid bot-detection blocks
+        # PRIMARY FIX: ios + tv_embedded clients bypass bot-detection completely.
+        # No PO token, no cookies required for public YouTube videos.
+        # Fallback chain: ios → tv_embedded → mweb → web
         "extractor_args": {
             "youtube": {
-                "player_client": ["web", "default"],
+                "player_client": ["ios", "tv_embedded", "mweb", "web"],
             }
         },
     }
     if for_info:
-        # KEY FIX (from WZML-X): fetch only the first item's metadata so yt-dlp
-        # does NOT try to expand entire playlists during info extraction.
+        # WZML-X fix: fetch only first item metadata — avoids playlist expansion.
         opts["playlist_items"] = "0"
 
     if _cookies_path and _cookies_path.exists():
         opts["cookiefile"] = str(_cookies_path)
         logger.info("Using cookies file: %s", _cookies_path)
     else:
-        logger.info("No cookies file — fetching public content only.")
+        logger.info("No cookies — public content only.")
 
     return opts
 
@@ -638,6 +656,173 @@ def _fetch_formats_sync(url: str) -> tuple:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  COBALT.TOOLS API  — permanent YouTube fallback (no cookies / auth required)
+# ═══════════════════════════════════════════════════════════════════════════════
+# cobalt.tools is a free, open-source media downloader API.
+# It handles YouTube internally without any auth or cookies.
+# Docs: https://github.com/imputnet/cobalt
+
+_COBALT_API   = "https://api.cobalt.tools/"
+_COBALT_HDRS  = {"Accept": "application/json", "Content-Type": "application/json"}
+_COBALT_TIMEOUT = aiohttp.ClientTimeout(total=30)
+
+# Static YouTube quality presets shown when yt-dlp fails to fetch formats.
+# cobalt handles the actual resolution server-side.
+_YT_COBALT_VIDEO_QUALITIES = [
+    ("🎥  4K  (2160p)",      "2160"),
+    ("🎬  2K  (1440p)",      "1440"),
+    ("🎬  Full HD  (1080p)", "1080"),
+    ("📺  HD  (720p)",       "720"),
+    ("📱  480p",             "480"),
+    ("📱  360p",             "360"),
+    ("🔅  240p",             "240"),
+    ("🔅  144p",             "144"),
+]
+_YT_COBALT_AUDIO_QUALITIES = [
+    ("🎵  MP3  (best quality)", "mp3",  "best"),
+    ("🔊  AAC",                 "aac",  "best"),
+    ("🔊  Opus",                "opus", "best"),
+]
+
+
+async def _cobalt_get_url(
+    url: str,
+    quality: str = "1080",
+    audio_only: bool = False,
+    audio_fmt: str = "mp3",
+) -> tuple[str | None, str, str]:
+    """
+    Call cobalt.tools API and return (download_url, filename, error).
+    download_url is None on failure.
+    """
+    payload: dict = {"url": url, "videoQuality": quality, "filenameStyle": "basic"}
+    if audio_only:
+        payload["downloadMode"] = "audio"
+        payload["audioFormat"]  = audio_fmt
+
+    try:
+        async with aiohttp.ClientSession(headers=_COBALT_HDRS, timeout=_COBALT_TIMEOUT) as sess:
+            async with sess.post(_COBALT_API, json=payload) as resp:
+                if resp.status != 200:
+                    text = await resp.text()
+                    return None, "", f"cobalt HTTP {resp.status}: {text[:200]}"
+                data = await resp.json(content_type=None)
+    except Exception as e:
+        return None, "", f"cobalt request failed: {e}"
+
+    status = data.get("status", "")
+    if status in ("stream", "tunnel", "redirect"):
+        return data.get("url"), data.get("filename", "video.mp4"), ""
+    elif status == "picker":
+        items = data.get("picker") or []
+        if items:
+            first = items[0]
+            return first.get("url"), first.get("filename", "video.mp4"), ""
+    # Error response
+    err = data.get("error", {})
+    if isinstance(err, dict):
+        code = err.get("code", "unknown")
+    else:
+        code = str(err)
+    return None, "", f"cobalt error: {code}"
+
+
+async def _cobalt_download_file(
+    dl_url: str,
+    filename: str,
+    out_dir: str,
+    url_hash: str,
+    cancel_ev: asyncio.Event,
+    status_msg,
+    fmt_label: str,
+) -> tuple[str | None, str]:
+    """
+    Download a file from a direct URL (cobalt stream) to out_dir.
+    Shows live progress. Returns (filepath, "done"|"cancelled"|"error").
+    """
+    filepath = os.path.join(out_dir, filename)
+    last_edit = 0.0
+
+    async def _update(pct: float, speed_bps: float, downloaded: int, total: int):
+        nonlocal last_edit
+        now = asyncio.get_event_loop().time()
+        if now - last_edit < 4:
+            return
+        last_edit = now
+        filled = min(int(pct / 10), 10)
+        bar    = "█" * filled + "░" * (10 - filled)
+        spd    = readable_bytes(speed_bps) + "/s" if speed_bps else "N/A"
+        sz     = readable_bytes(total) if total else "?"
+        text   = (
+            f"📥 Downloading…\n\n"
+            f"📌 *{fmt_label}*\n\n"
+            f"`[{bar}] {pct:.1f}%`\n\n"
+            f"📦 Size : `{sz}`\n"
+            f"⚡ Speed: `{spd}`"
+        )
+        try:
+            await status_msg.edit_text(text, reply_markup=kb_cancel(url_hash))
+        except Exception:
+            pass
+
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=3600)) as sess:
+            async with sess.get(dl_url) as resp:
+                if resp.status not in (200, 206):
+                    return None, "error"
+                total     = int(resp.headers.get("Content-Length", 0))
+                downloaded = 0
+                t0         = asyncio.get_event_loop().time()
+
+                with open(filepath, "wb") as fh:
+                    async for chunk in resp.content.iter_chunked(65536):
+                        if cancel_ev.is_set():
+                            return None, "cancelled"
+                        fh.write(chunk)
+                        downloaded += len(chunk)
+                        elapsed = asyncio.get_event_loop().time() - t0 or 0.001
+                        speed   = downloaded / elapsed
+                        pct     = (downloaded / total * 100) if total else 0
+                        await _update(pct, speed, downloaded, total)
+
+    except asyncio.CancelledError:
+        return None, "cancelled"
+    except Exception as e:
+        logger.error("cobalt download error: %s", e)
+        return None, "error"
+
+    if cancel_ev.is_set():
+        return None, "cancelled"
+    return filepath, "done"
+
+
+def _make_cobalt_formats(url: str) -> list[dict]:
+    """
+    Build a static quality list for YouTube via cobalt.tools.
+    Called when yt-dlp fails to fetch formats for a YouTube URL.
+    """
+    fmts: list[dict] = []
+    for label, quality in _YT_COBALT_VIDEO_QUALITIES:
+        fmts.append({
+            "label":         label,
+            "is_audio":      False,
+            "cobalt":        True,
+            "cobalt_url":    url,
+            "cobalt_quality": quality,
+        })
+    for label, audio_fmt, _ in _YT_COBALT_AUDIO_QUALITIES:
+        fmts.append({
+            "label":           label,
+            "is_audio":        True,
+            "cobalt":          True,
+            "cobalt_url":      url,
+            "cobalt_quality":  "max",
+            "cobalt_audio_fmt": audio_fmt,
+        })
+    return fmts
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  YT-DLP COMMAND BUILDER
 # ═══════════════════════════════════════════════════════════════════════════════
 def _build_cmd(url: str, fmt: dict, out_dir: str) -> list[str]:
@@ -650,8 +835,8 @@ def _build_cmd(url: str, fmt: dict, out_dir: str) -> list[str]:
         "--retries", "10",
         "--fragment-retries", "10",
         "--http-chunk-size", "1048576",
-        # YouTube extractor args: use web player client to bypass bot detection
-        "--extractor-args", "youtube:player_client=web,default",
+        # YouTube: ios + tv_embedded bypass bot-detection without any auth/cookies
+        "--extractor-args", "youtube:player_client=ios,tv_embedded,mweb,web",
         "-o", tpl,
     ]
     if _cookies_path and _cookies_path.exists():
@@ -726,12 +911,36 @@ async def _run_download(
     status_msg,
 ) -> tuple[str | None, str]:
     """
-    Runs yt-dlp as an async subprocess, reads stdout line-by-line,
-    updates `status_msg` with a live progress bar, and respects `cancel_ev`.
+    Dispatcher: routes to either the cobalt downloader (for YouTube cobalt-fallback
+    formats) or the yt-dlp subprocess downloader (for all other formats).
     Returns (filepath, "done" | "cancelled" | "error").
     """
-    cmd = _build_cmd(url, fmt, out_dir)
     fmt_label = fmt["label"]
+
+    # ── cobalt.tools path (YouTube fallback) ──────────────────────────────────
+    if fmt.get("cobalt"):
+        try:
+            await status_msg.edit_text(
+                f"🔗 *Getting download link…*\n\n📌 *{fmt_label}*",
+                reply_markup=kb_cancel(url_hash),
+            )
+        except Exception:
+            pass
+        dl_url, filename, err = await _cobalt_get_url(
+            fmt["cobalt_url"],
+            quality    = fmt.get("cobalt_quality", "1080"),
+            audio_only = fmt.get("is_audio", False),
+            audio_fmt  = fmt.get("cobalt_audio_fmt", "mp3"),
+        )
+        if not dl_url:
+            logger.error("cobalt_get_url failed: %s", err)
+            return None, "error"
+        return await _cobalt_download_file(
+            dl_url, filename, out_dir, url_hash, cancel_ev, status_msg, fmt_label
+        )
+
+    # ── yt-dlp subprocess path ────────────────────────────────────────────────
+    cmd = _build_cmd(url, fmt, out_dir)
 
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -1043,10 +1252,29 @@ async def handle_url(msg: Message, user, url: str):
         None, _fetch_formats_sync, url
     )
 
+    # ── cobalt.tools fallback for YouTube ─────────────────────────────────────
+    # When yt-dlp fails to fetch YouTube formats (bot-detection, IP block, etc.),
+    # we fall back to cobalt.tools which needs NO cookies, NO auth — permanent fix.
+    using_cobalt = False
+    if not formats and _is_youtube_url(url):
+        logger.info("yt-dlp failed for YouTube URL — switching to cobalt.tools fallback.")
+        try:
+            await status.edit_text(
+                "⚙️ *yt-dlp blocked by YouTube…*\n"
+                "🔄 Switching to alternative downloader (cobalt.tools)\n"
+                "_This requires no cookies and works permanently!_"
+            )
+        except Exception:
+            pass
+        await asyncio.sleep(1.5)
+        formats = _make_cobalt_formats(url)
+        using_cobalt = True
+        title = title or "YouTube Video"
+        thumb = thumb or config.THUMB_DEFAULT
+
     if not formats:
         err_detail = ""
         if fetch_error:
-            # Show the first 300 chars of the yt-dlp error so user/admin can diagnose
             snippet = fetch_error[:300].strip()
             err_detail = f"\n\n⚠️ *Error details:*\n`{snippet}`"
         await status.edit_text(
@@ -1067,10 +1295,12 @@ async def handle_url(msg: Message, user, url: str):
     }
 
     short = title[:60] + ("…" if len(title) > 60 else "")
-    cap   = (
+    cobalt_note = "\n_⚡ Powered by cobalt.tools — no cookies needed_" if using_cobalt else ""
+    cap = (
         f"🎬 *{short}*\n\n"
         f"📊 *Choose your quality:*\n"
         f"_({len(formats)} options — tap to start downloading)_"
+        + cobalt_note
     )
 
     await status.delete()
@@ -1383,8 +1613,14 @@ async def do_download(query: CallbackQuery, user, url_hash: str, fmt_idx: str):
             f"📦 {readable_bytes(filesize)}"
         )
 
+        # Detect whether to send as audio or video.
+        # For cobalt downloads the file extension tells us the type.
+        _AUDIO_EXTS = {".mp3", ".aac", ".flac", ".opus", ".ogg", ".wav", ".m4a"}
+        file_ext    = os.path.splitext(filepath)[1].lower()
+        send_as_audio = fmt["is_audio"] or file_ext in _AUDIO_EXTS
+
         try:
-            if fmt["is_audio"]:
+            if send_as_audio:
                 await app.send_audio(
                     user.id,
                     audio=filepath,
@@ -1403,15 +1639,25 @@ async def do_download(query: CallbackQuery, user, url_hash: str, fmt_idx: str):
                 )
         except Exception as e:
             logger.error("Upload error: %s", e)
+            # Final fallback: send as a plain document if video/audio send fails
             try:
-                await status_msg.edit_text(
-                    "❌ *Upload failed!*\n\n"
-                    "The file was downloaded but couldn't be sent.\n"
-                    "It may be corrupted — try again."
+                await app.send_document(
+                    user.id,
+                    document=filepath,
+                    caption=file_caption,
+                    progress=upload_progress,
                 )
-            except Exception:
-                pass
-            return
+            except Exception as e2:
+                logger.error("Document upload also failed: %s", e2)
+                try:
+                    await status_msg.edit_text(
+                        "❌ *Upload failed!*\n\n"
+                        "The file was downloaded but couldn't be sent.\n"
+                        "It may be corrupted — try again."
+                    )
+                except Exception:
+                    pass
+                return
 
     # Clean up
     pending.pop(url_hash, None)
