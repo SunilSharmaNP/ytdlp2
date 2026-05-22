@@ -469,82 +469,172 @@ def readable_bytes(b: int | float) -> str:
 # ═══════════════════════════════════════════════════════════════════════════════
 #  FORMAT FETCHING  (yt-dlp Python API, run in executor)
 # ═══════════════════════════════════════════════════════════════════════════════
-def _build_ydl_opts() -> dict:
-    opts = {
+def _build_ydl_opts(for_info: bool = False) -> dict:
+    """
+    Build yt-dlp options.
+    for_info=True  → lightweight metadata-only fetch (no playlist expansion).
+    for_info=False → full download options.
+    Inspired by WZML-X (wzv3 branch) yt_dlp_download.py.
+    """
+    opts: dict = {
         "quiet": True,
         "no_warnings": True,
         "noprogress": True,
         "socket_timeout": config.INFO_TIMEOUT,
+        "usenetrc": True,
+        # Allow yt-dlp to pick the best combination of video+audio streams
+        "allow_multiple_video_streams": True,
+        "allow_multiple_audio_streams": True,
+        # Retry settings (WZML-X style)
+        "retries": 10,
+        "fragment_retries": 10,
+        "retry_sleep_functions": {
+            "http":        lambda n: 3,
+            "fragment":    lambda n: 3,
+            "file_access": lambda n: 3,
+            "extractor":   lambda n: 3,
+        },
+        # YouTube-specific: use web player client to avoid bot-detection blocks
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["web", "default"],
+            }
+        },
     }
+    if for_info:
+        # KEY FIX (from WZML-X): fetch only the first item's metadata so yt-dlp
+        # does NOT try to expand entire playlists during info extraction.
+        opts["playlist_items"] = "0"
+
     if _cookies_path and _cookies_path.exists():
         opts["cookiefile"] = str(_cookies_path)
+        logger.info("Using cookies file: %s", _cookies_path)
+    else:
+        logger.info("No cookies file — fetching public content only.")
+
     return opts
 
 
-def _fetch_formats_sync(url: str):
-    """Blocking. Returns (title, thumbnail_url, formats_list)."""
+def _fetch_formats_sync(url: str) -> tuple:
+    """
+    Blocking. Returns (title, thumbnail_url, formats_list, error_str).
+    error_str is non-empty when yt-dlp raised an exception.
+
+    Format parsing follows the WZML-X (wzv3) approach:
+    - Filter by tbr (total bitrate) to skip zero/invalid streams.
+    - Use video_ext / height / acodec to classify video vs audio streams.
+    - Build proper yt-dlp format selectors.
+    """
     import yt_dlp
 
+    error_str = ""
+    info = None
     try:
-        with yt_dlp.YoutubeDL(_build_ydl_opts()) as ydl:
+        with yt_dlp.YoutubeDL(_build_ydl_opts(for_info=True)) as ydl:
             info = ydl.extract_info(url, download=False)
-            if info is None:
-                return None, None, []
+    except yt_dlp.utils.DownloadError as e:
+        error_str = str(e).replace("<", " ").replace(">", " ")
+        logger.warning("_fetch_formats_sync DownloadError: %s", error_str)
     except Exception as e:
-        logger.warning("_fetch_formats_sync error: %s", e)
-        return None, None, []
+        error_str = str(e)
+        logger.warning("_fetch_formats_sync error: %s", error_str)
+
+    if info is None:
+        return None, None, [], error_str
 
     title     = info.get("title", "Unknown")
     thumbnail = info.get("thumbnail")
 
-    # ── Video formats ─────────────────────────────────────────────────────────
-    seen: dict[int, dict] = {}
-    for fmt in info.get("formats", []):
-        h      = fmt.get("height")
-        vcodec = fmt.get("vcodec", "none")
-        if not h or vcodec in ("none", None, ""):
-            continue
-        fs = fmt.get("filesize") or fmt.get("filesize_approx") or 0
-        if h not in seen or fs > seen[h].get("filesize", 0):
-            seen[h] = {
-                "format_id": fmt["format_id"],
-                "ext":       fmt.get("ext", "mp4"),
-                "filesize":  fs,
-                "fps":       fmt.get("fps") or "",
-                "height":    h,
-            }
+    # ── Video format parsing (WZML-X tbr-based approach) ──────────────────────
+    # Key insight from WZML-X: only process formats that have a valid tbr
+    # (total bitrate). Formats with tbr=0 or None are incomplete/invalid.
+    _is_m4a = False
 
+    # b_name (e.g. "1080p30") → tbr_str → [filesize, ytdl_fmt, height, fps]
+    fmt_dict: dict[str, dict] = {}
+
+    for item in info.get("formats") or []:
+        if not item.get("tbr"):
+            continue  # skip zero/None bitrate formats (WZML-X fix)
+
+        format_id = item["format_id"]
+        size = item.get("filesize") or item.get("filesize_approx") or 0
+
+        # Detect m4a audio stream (affects format selector for mp4 video)
+        if item.get("video_ext") == "none" and (
+            item.get("resolution") == "audio only"
+            or item.get("acodec") not in (None, "none", "")
+        ):
+            if item.get("audio_ext") == "m4a":
+                _is_m4a = True
+            # Audio-only streams are not added as standalone video options
+            continue
+
+        if not item.get("height"):
+            continue  # skip formats without resolution (e.g. storyboards)
+
+        height = int(item["height"])
+        ext    = item.get("ext", "mp4")
+        fps    = item.get("fps") or ""
+
+        # Build a yt-dlp format selector: video stream + best audio
+        # (WZML-X: ba[ext=m4a] when m4a audio is available + video is mp4)
+        ba_ext   = "[ext=m4a]" if _is_m4a and ext == "mp4" else ""
+        ytdl_fmt = f"{format_id}+ba{ba_ext}/b[height=?{height}]"
+
+        fps_label = f"{int(fps)}" if fps else ""
+        b_name    = f"{height}p{fps_label}"
+        tbr_str   = str(item["tbr"])
+
+        fmt_dict.setdefault(b_name, {})[tbr_str] = [size, ytdl_fmt, height, fps]
+
+    # Build the final formats list sorted by height descending
     formats: list[dict] = []
-    for h, d in sorted(seen.items(), reverse=True):
-        emoji    = config.QUALITY_EMOJI.get(h, "🎥")
-        tag      = config.HD_LABEL.get(h, "")
-        fps_str  = f" {d['fps']}fps" if d["fps"] else ""
-        size_str = readable_size(d["filesize"])
+    def _height_of(key: str) -> int:
+        try:
+            return int(key.rstrip("p0123456789").rstrip("p") or key.split("p")[0])
+        except Exception:
+            return 0
+
+    for b_name in sorted(fmt_dict.keys(),
+                         key=lambda k: int(k.split("p")[0]) if k.split("p")[0].isdigit() else 0,
+                         reverse=True):
+        tbr_dict = fmt_dict[b_name]
+
+        # Pick the entry with the highest bitrate (best quality for that resolution)
+        best_tbr = max(tbr_dict.keys(), key=lambda x: float(x))
+        size, ytdl_fmt, height, fps = tbr_dict[best_tbr]
+
+        emoji    = config.QUALITY_EMOJI.get(height, "🎥")
+        tag      = config.HD_LABEL.get(height, "")
+        fps_str  = f" {int(fps)}fps" if fps else ""
+        size_str = readable_size(size)
+
         formats.append({
-            "label":       f"{emoji}  {h}p{tag}{fps_str}{size_str}",
-            "ytdl_fmt":    f"{d['format_id']}+bestaudio[ext=m4a]/+bestaudio",
-            "is_audio":    False,
-            "height":      h,
+            "label":    f"{emoji}  {height}p{tag}{fps_str}{size_str}",
+            "ytdl_fmt": ytdl_fmt,
+            "is_audio": False,
+            "height":   height,
         })
 
-    # ── Audio formats ─────────────────────────────────────────────────────────
+    # ── Audio-only formats ────────────────────────────────────────────────────
     for label, aud_fmt, aud_qual in [
-        ("🎵  MP3  320 Kbps",   "mp3",   "0"),
-        ("🎵  MP3  128 Kbps",   "mp3",   "5"),
-        ("🔊  AAC",             "aac",   "0"),
-        ("🔊  FLAC  (lossless)","flac",  "0"),
-        ("🔊  Opus",            "opus",  "0"),
-        ("🔊  WAV",             "wav",   "0"),
+        ("🎵  MP3  320 Kbps",    "mp3",  "0"),
+        ("🎵  MP3  128 Kbps",    "mp3",  "5"),
+        ("🔊  AAC",              "aac",  "0"),
+        ("🔊  FLAC  (lossless)", "flac", "0"),
+        ("🔊  Opus",             "opus", "0"),
+        ("🔊  WAV",              "wav",  "0"),
     ]:
         formats.append({
-            "label":       label,
-            "ytdl_fmt":    "bestaudio/best",
-            "is_audio":    True,
-            "audio_fmt":   aud_fmt,
-            "audio_qual":  aud_qual,
+            "label":      label,
+            "ytdl_fmt":   "bestaudio/best",
+            "is_audio":   True,
+            "audio_fmt":  aud_fmt,
+            "audio_qual": aud_qual,
         })
 
-    return title, thumbnail, formats
+    return title, thumbnail, formats, error_str
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -557,9 +647,11 @@ def _build_cmd(url: str, fmt: dict, out_dir: str) -> list[str]:
         "--no-playlist",
         "--progress",
         "--newline",
-        "--retries", "5",
-        "--fragment-retries", "5",
+        "--retries", "10",
+        "--fragment-retries", "10",
         "--http-chunk-size", "1048576",
+        # YouTube extractor args: use web player client to bypass bot detection
+        "--extractor-args", "youtube:player_client=web,default",
         "-o", tpl,
     ]
     if _cookies_path and _cookies_path.exists():
@@ -946,15 +1038,23 @@ async def on_message(_, msg: Message):
 async def handle_url(msg: Message, user, url: str):
     status = await msg.reply("🔍 *Fetching media info…*\nHang tight ⏳")
 
-    loop                  = asyncio.get_event_loop()
-    title, thumb, formats = await loop.run_in_executor(None, _fetch_formats_sync, url)
+    loop = asyncio.get_event_loop()
+    title, thumb, formats, fetch_error = await loop.run_in_executor(
+        None, _fetch_formats_sync, url
+    )
 
     if not formats:
+        err_detail = ""
+        if fetch_error:
+            # Show the first 300 chars of the yt-dlp error so user/admin can diagnose
+            snippet = fetch_error[:300].strip()
+            err_detail = f"\n\n⚠️ *Error details:*\n`{snippet}`"
         await status.edit_text(
             "❌ *Could not fetch media info!*\n\n"
             "• Check that the link is valid and publicly accessible\n"
-            "• Age-restricted content requires cookies (ask the admin)\n"
-            "• Try again in a few seconds"
+            "• Age-restricted / members-only content requires fresh cookies (ask the admin)\n"
+            "• YouTube may be blocking the request — try again in a few seconds"
+            + err_detail
         )
         return
 
