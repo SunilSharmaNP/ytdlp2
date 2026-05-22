@@ -656,32 +656,50 @@ def _fetch_formats_sync(url: str) -> tuple:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  INVIDIOUS API  — permanent YouTube fallback (no cookies / auth required)
+#  YOUTUBE FREE-API FALLBACK  (Invidious → Piped, no cookies / auth needed)
 # ═══════════════════════════════════════════════════════════════════════════════
-# Invidious is an open-source YouTube frontend with a public JSON API.
-# Community-run instances use their own residential/VPS IPs →
-# no Heroku datacenter bot-detection. No auth, no cookies, no JWT.
-# API docs: https://docs.invidious.io/api/
+# Two community-run YouTube frontends with public JSON APIs.
+# Both use their own server IPs → no Heroku datacenter bot-detection.
 #
-# IMPORTANT: Invidious stream URLs expire quickly (~6h), so we NEVER cache them.
-# We store only (video_id, itag) at format-list time and re-fetch a fresh URL
-# at download time from whichever instance is currently alive.
+# Fallback chain:
+#   1. Invidious  — /api/v1/videos/{id}  → adaptiveFormats (itag-based)
+#   2. Piped      — /streams/{id}        → videoStreams/audioStreams (quality-based)
+#
+# Stream URLs expire, so we NEVER store them. We store (video_id + itag OR
+# quality+codec) and re-fetch a fresh URL at actual download time.
 
+# ── Invidious instances (checked 2026-05) ─────────────────────────────────────
 _INVIDIOUS_INSTANCES = [
-    "https://inv.nadeko.net",
-    "https://invidious.fdn.fr",
-    "https://invidious.nerdvpn.de",
-    "https://iv.datura.network",
-    "https://invidious.privacydev.net",
-    "https://invidious.lunar.icu",
-    "https://yt.drgnz.club",
+    "https://inv.nadeko.net",        # CL — usually reachable from Heroku
+    "https://yewtu.be",              # NL — popular, stable
+    "https://invidious.io.lol",      # Cloudflare-proxied, very reliable
+    "https://invidious.jing.rocks",  # US
+    "https://vid.priv.au",           # AU
+    "https://invidious.nerdvpn.de",  # DE
+    "https://invidious.asir.dev",    # ES
 ]
-_INVIDIOUS_TIMEOUT = aiohttp.ClientTimeout(total=15)
+
+# ── Piped instances ────────────────────────────────────────────────────────────
+_PIPED_INSTANCES = [
+    "https://pipedapi.kavin.rocks",          # primary (Kavin's official)
+    "https://pipedapi.adminforge.de",        # DE mirror
+    "https://piped-api.garudalinux.org",     # IN/EU
+    "https://pipedapi.tokhmi.xyz",           # US
+    "https://piped.smnz.de",                # DE
+]
+
+_YT_FREE_TIMEOUT = aiohttp.ClientTimeout(total=15)
 
 _YT_ID_RE = re.compile(
     r"(?:youtube\.com/(?:watch\?(?:.*&)?v=|embed/|v/|shorts/)|youtu\.be/)"
     r"([A-Za-z0-9_-]{11})"
 )
+
+_QEMOJI: dict[str, str] = {
+    "2160p": "🎥", "1440p": "🎬", "1080p": "🎬",
+    "720p":  "📺", "480p":  "📱", "360p":  "📱",
+    "240p":  "🔅", "144p":  "🔅",
+}
 
 
 def _extract_youtube_id(url: str) -> str | None:
@@ -690,150 +708,232 @@ def _extract_youtube_id(url: str) -> str | None:
     return m.group(1) if m else None
 
 
+# ── Invidious helpers ──────────────────────────────────────────────────────────
+
 async def _invidious_api_get(path: str) -> dict | None:
-    """
-    Try each Invidious instance in order until one returns a 200 JSON response.
-    Returns parsed dict or None if all fail.
-    """
+    """Try each Invidious instance until one returns HTTP 200 JSON."""
     for instance in _INVIDIOUS_INSTANCES:
-        url = f"{instance}{path}"
         try:
-            async with aiohttp.ClientSession(timeout=_INVIDIOUS_TIMEOUT) as sess:
-                async with sess.get(url) as resp:
+            async with aiohttp.ClientSession(timeout=_YT_FREE_TIMEOUT) as sess:
+                async with sess.get(f"{instance}{path}") as resp:
                     if resp.status == 200:
                         return await resp.json(content_type=None)
         except Exception as e:
-            logger.warning("Invidious instance %s failed: %s", instance, e)
+            logger.warning("Invidious %s failed: %s", instance, e)
     return None
 
 
-async def _invidious_fetch_info(video_id: str) -> tuple[str | None, str | None, list]:
-    """
-    Fetch video info from Invidious.
-    Returns (title, thumbnail_url, raw_adaptive_formats_list).
-    """
-    data = await _invidious_api_get(
-        f"/api/v1/videos/{video_id}"
-        f"?fields=title,videoThumbnails,adaptiveFormats"
-    )
-    if not data:
-        return None, None, []
-
-    title  = data.get("title")
-    thumbs = data.get("videoThumbnails", [])
-    thumb  = None
-    for quality in ("maxresdefault", "sddefault", "high", "medium", "default"):
-        for t in thumbs:
-            if t.get("quality") == quality:
-                thumb = t.get("url")
-                break
-        if thumb:
-            break
-    if not thumb and thumbs:
-        thumb = thumbs[0].get("url")
-
-    raw_formats = data.get("adaptiveFormats", [])
-    return title, thumb, raw_formats
-
-
-async def _invidious_get_stream_url(video_id: str, itag: str) -> tuple[str | None, str]:
-    """
-    Re-fetch a FRESH stream URL for (video_id, itag) at download time.
-    Returns (stream_url, error_string). stream_url is None on failure.
-    """
-    data = await _invidious_api_get(
-        f"/api/v1/videos/{video_id}?fields=adaptiveFormats"
-    )
-    if not data:
-        return None, "All Invidious instances failed"
-    for fmt in data.get("adaptiveFormats", []):
-        if str(fmt.get("itag")) == str(itag):
-            stream_url = fmt.get("url")
-            if stream_url:
-                return stream_url, ""
-    return None, f"itag {itag} not found in Invidious response"
-
-
 def _parse_invidious_formats(raw_formats: list, video_id: str) -> list[dict]:
-    """
-    Convert Invidious adaptiveFormats to our internal format dict list.
-    We store only (video_id, itag) — NOT the URL (it expires).
-    At download time _invidious_get_stream_url() re-fetches a fresh URL.
-    """
-    _QEMOJI = {
-        "2160p": "🎥", "1440p": "🎬", "1080p": "🎬",
-        "720p":  "📺", "480p":  "📱", "360p":  "📱",
-        "240p":  "🔅", "144p":  "🔅",
-    }
-
+    """Convert Invidious adaptiveFormats → internal format dicts."""
     seen_video: set[str] = set()
     seen_audio: set[str] = set()
     fmts: list[dict]     = []
 
-    # ── Video ─────────────────────────────────────────────────────────────────
-    video_raw = [
-        f for f in raw_formats
-        if f.get("type", "").startswith("video/") and f.get("qualityLabel")
-    ]
-    # Sort descending by vertical resolution (e.g. "1920x1080" → 1080)
     def _vres(f: dict) -> int:
-        res = f.get("resolution", "0x0")
         try:
-            return int(res.split("x")[-1])
+            return int(f.get("resolution", "0x0").split("x")[-1])
         except Exception:
             return 0
-    video_raw.sort(key=_vres, reverse=True)
 
+    video_raw = sorted(
+        [f for f in raw_formats if f.get("type", "").startswith("video/") and f.get("qualityLabel")],
+        key=_vres, reverse=True,
+    )
     for f in video_raw:
         qlabel = f.get("qualityLabel", "")
-        mime   = f.get("type", "")
-        codec  = "mp4" if "mp4" in mime else "webm"
-        itag   = str(f.get("itag", ""))
+        codec  = "mp4" if "mp4" in f.get("type", "") else "webm"
         key    = f"{qlabel}_{codec}"
         if key in seen_video:
             continue
         seen_video.add(key)
-        emoji = _QEMOJI.get(qlabel, "🎬")
         fmts.append({
-            "label":              f"{emoji}  {qlabel}  [{codec.upper()}]",
+            "label":              f"{_QEMOJI.get(qlabel, '🎬')}  {qlabel}  [{codec.upper()}]",
             "is_audio":           False,
             "invidious":          True,
+            "yt_api":             "invidious",
             "invidious_video_id": video_id,
-            "invidious_itag":     itag,
+            "invidious_itag":     str(f.get("itag", "")),
             "invidious_ext":      codec,
         })
 
-    # ── Audio ─────────────────────────────────────────────────────────────────
-    audio_raw = [
-        f for f in raw_formats
-        if f.get("type", "").startswith("audio/")
-    ]
-    audio_raw.sort(key=lambda f: int(f.get("bitrate", 0)), reverse=True)
-
+    audio_raw = sorted(
+        [f for f in raw_formats if f.get("type", "").startswith("audio/")],
+        key=lambda f: int(f.get("bitrate", 0)), reverse=True,
+    )
     for f in audio_raw:
-        mime  = f.get("type", "")
-        codec = "opus" if "opus" in mime else "m4a"
-        itag  = str(f.get("itag", ""))
+        codec = "opus" if "opus" in f.get("type", "") else "m4a"
         if codec in seen_audio:
             continue
         seen_audio.add(codec)
-        ext_label = "Opus (WebM)" if codec == "opus" else "M4A (AAC)"
         fmts.append({
-            "label":              f"🎵  Audio — {ext_label}",
+            "label":              f"🎵  Audio — {'Opus (WebM)' if codec == 'opus' else 'M4A (AAC)'}",
             "is_audio":           True,
             "invidious":          True,
+            "yt_api":             "invidious",
             "invidious_video_id": video_id,
-            "invidious_itag":     itag,
+            "invidious_itag":     str(f.get("itag", "")),
             "invidious_ext":      codec,
         })
 
     return fmts
 
 
+# ── Piped helpers ──────────────────────────────────────────────────────────────
+
+async def _piped_api_get(video_id: str) -> dict | None:
+    """Try each Piped instance until one returns HTTP 200 JSON for /streams/{id}."""
+    for instance in _PIPED_INSTANCES:
+        try:
+            async with aiohttp.ClientSession(timeout=_YT_FREE_TIMEOUT) as sess:
+                async with sess.get(f"{instance}/streams/{video_id}") as resp:
+                    if resp.status == 200:
+                        return await resp.json(content_type=None)
+        except Exception as e:
+            logger.warning("Piped %s failed: %s", instance, e)
+    return None
+
+
+def _parse_piped_formats(data: dict, video_id: str) -> list[dict]:
+    """Convert Piped /streams response → internal format dicts."""
+    seen_video: set[str] = set()
+    seen_audio: set[str] = set()
+    fmts: list[dict]     = []
+
+    video_streams = sorted(
+        [s for s in data.get("videoStreams", []) if s.get("quality")],
+        key=lambda s: int(s.get("height", 0) or 0), reverse=True,
+    )
+    for s in video_streams:
+        qlabel = s.get("quality", "")        # e.g. "1080p"
+        codec  = "mp4" if "mp4" in s.get("mimeType", "") else "webm"
+        key    = f"{qlabel}_{codec}"
+        if key in seen_video:
+            continue
+        seen_video.add(key)
+        fmts.append({
+            "label":              f"{_QEMOJI.get(qlabel, '🎬')}  {qlabel}  [{codec.upper()}]  ⚡Piped",
+            "is_audio":           False,
+            "invidious":          True,   # reuse routing key
+            "yt_api":             "piped",
+            "invidious_video_id": video_id,
+            "invidious_itag":     None,
+            "invidious_ext":      codec,
+            "piped_quality":      qlabel,
+            "piped_codec":        codec,
+        })
+
+    audio_streams = sorted(
+        data.get("audioStreams", []),
+        key=lambda s: int(s.get("bitrate", 0) or 0), reverse=True,
+    )
+    for s in audio_streams:
+        codec = "opus" if "opus" in s.get("mimeType", "") else "m4a"
+        if codec in seen_audio:
+            continue
+        seen_audio.add(codec)
+        fmts.append({
+            "label":              f"🎵  Audio — {'Opus (WebM)' if codec == 'opus' else 'M4A (AAC)'}  ⚡Piped",
+            "is_audio":           True,
+            "invidious":          True,
+            "yt_api":             "piped",
+            "invidious_video_id": video_id,
+            "invidious_itag":     None,
+            "invidious_ext":      codec,
+            "piped_quality":      s.get("quality", ""),
+            "piped_codec":        codec,
+        })
+
+    return fmts
+
+
+# ── Unified info fetch (Invidious → Piped) ────────────────────────────────────
+
+async def _invidious_fetch_info(video_id: str) -> tuple[str | None, str | None, list]:
+    """
+    Try Invidious first, then Piped.
+    Returns (title, thumbnail_url, format_list).
+    """
+    # ── Try Invidious ──────────────────────────────────────────────────────────
+    inv_data = await _invidious_api_get(
+        f"/api/v1/videos/{video_id}?fields=title,videoThumbnails,adaptiveFormats"
+    )
+    if inv_data and inv_data.get("adaptiveFormats"):
+        title  = inv_data.get("title")
+        thumbs = inv_data.get("videoThumbnails", [])
+        thumb  = next(
+            (t["url"] for q in ("maxresdefault","sddefault","high","medium","default")
+             for t in thumbs if t.get("quality") == q),
+            thumbs[0]["url"] if thumbs else None,
+        )
+        fmts = _parse_invidious_formats(inv_data["adaptiveFormats"], video_id)
+        if fmts:
+            logger.info("Invidious OK for video_id=%s (%d formats)", video_id, len(fmts))
+            return title, thumb, fmts
+
+    logger.warning("Invidious failed for video_id=%s, trying Piped…", video_id)
+
+    # ── Try Piped ─────────────────────────────────────────────────────────────
+    piped_data = await _piped_api_get(video_id)
+    if piped_data:
+        title = piped_data.get("title")
+        thumb = piped_data.get("thumbnailUrl")
+        fmts  = _parse_piped_formats(piped_data, video_id)
+        if fmts:
+            logger.info("Piped OK for video_id=%s (%d formats)", video_id, len(fmts))
+            return title, thumb, fmts
+
+    logger.error("Both Invidious and Piped failed for video_id=%s", video_id)
+    return None, None, []
+
+
+# ── Stream URL refresh at download time ───────────────────────────────────────
+
+async def _invidious_get_stream_url(fmt: dict) -> tuple[str | None, str]:
+    """
+    Re-fetch a FRESH stream URL at download time (URLs expire).
+    Dispatches to Invidious (by itag) or Piped (by quality+codec).
+    """
+    video_id = fmt["invidious_video_id"]
+
+    if fmt.get("yt_api") == "piped":
+        # Re-fetch from Piped and match by quality + codec
+        piped_data = await _piped_api_get(video_id)
+        if not piped_data:
+            return None, "All Piped instances failed"
+        is_audio = fmt["is_audio"]
+        target_q = fmt.get("piped_quality", "")
+        codec    = fmt.get("piped_codec", "")
+        streams  = piped_data.get("audioStreams" if is_audio else "videoStreams", [])
+        for s in streams:
+            s_codec = "opus" if "opus" in s.get("mimeType", "") else ("m4a" if is_audio else "mp4" if "mp4" in s.get("mimeType","") else "webm")
+            if is_audio:
+                if s_codec == codec:
+                    return s.get("url"), ""
+            else:
+                if s.get("quality") == target_q and s_codec == codec:
+                    return s.get("url"), ""
+        return None, f"Piped: stream not found (quality={target_q} codec={codec})"
+
+    else:
+        # Re-fetch from Invidious by itag
+        itag = fmt.get("invidious_itag", "")
+        data = await _invidious_api_get(
+            f"/api/v1/videos/{video_id}?fields=adaptiveFormats"
+        )
+        if not data:
+            return None, "All Invidious instances failed"
+        for f in data.get("adaptiveFormats", []):
+            if str(f.get("itag")) == str(itag):
+                url = f.get("url")
+                if url:
+                    return url, ""
+        return None, f"Invidious: itag {itag} not found"
+
+
+# ── Streaming download helper ──────────────────────────────────────────────────
+
 async def _invidious_download_file(
-    video_id: str,
-    itag: str,
-    ext: str,
+    fmt: dict,
     out_dir: str,
     url_hash: str,
     cancel_ev: asyncio.Event,
@@ -841,7 +941,7 @@ async def _invidious_download_file(
     fmt_label: str,
 ) -> tuple[str | None, str]:
     """
-    Fetch a fresh stream URL from Invidious, then stream-download it.
+    Get a fresh stream URL from Invidious/Piped, then stream-download it.
     Returns (filepath, "done"|"cancelled"|"error").
     """
     try:
@@ -852,13 +952,15 @@ async def _invidious_download_file(
     except Exception:
         pass
 
-    stream_url, err = await _invidious_get_stream_url(video_id, itag)
+    stream_url, err = await _invidious_get_stream_url(fmt)
     if not stream_url:
-        logger.error("Invidious stream URL failed: %s", err)
+        logger.error("Stream URL fetch failed: %s", err)
         return None, "error"
 
-    filename = f"{video_id}_{itag}.{ext}"
-    filepath = os.path.join(out_dir, filename)
+    video_id = fmt["invidious_video_id"]
+    itag     = fmt.get("invidious_itag") or fmt.get("piped_quality", "dl")
+    ext      = fmt.get("invidious_ext", "mp4")
+    filepath = os.path.join(out_dir, f"{video_id}_{itag}.{ext}")
     last_edit = 0.0
 
     async def _update(pct: float, speed_bps: float, total: int):
@@ -871,15 +973,13 @@ async def _invidious_download_file(
         bar    = "█" * filled + "░" * (10 - filled)
         spd    = readable_bytes(speed_bps) + "/s" if speed_bps else "N/A"
         sz     = readable_bytes(total) if total else "?"
-        text   = (
-            f"📥 Downloading…\n\n"
-            f"📌 *{fmt_label}*\n\n"
-            f"`[{bar}] {pct:.1f}%`\n\n"
-            f"📦 Size : `{sz}`\n"
-            f"⚡ Speed: `{spd}`"
-        )
         try:
-            await status_msg.edit_text(text, reply_markup=kb_cancel(url_hash))
+            await status_msg.edit_text(
+                f"📥 Downloading…\n\n📌 *{fmt_label}*\n\n"
+                f"`[{bar}] {pct:.1f}%`\n\n"
+                f"📦 Size : `{sz}`\n⚡ Speed: `{spd}`",
+                reply_markup=kb_cancel(url_hash),
+            )
         except Exception:
             pass
 
@@ -887,12 +987,11 @@ async def _invidious_download_file(
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=3600)) as sess:
             async with sess.get(stream_url) as resp:
                 if resp.status not in (200, 206):
-                    logger.error("Invidious stream returned HTTP %s", resp.status)
+                    logger.error("Stream returned HTTP %s", resp.status)
                     return None, "error"
                 total      = int(resp.headers.get("Content-Length", 0))
                 downloaded = 0
                 t0         = asyncio.get_event_loop().time()
-
                 with open(filepath, "wb") as fh:
                     async for chunk in resp.content.iter_chunked(65536):
                         if cancel_ev.is_set():
@@ -900,14 +999,13 @@ async def _invidious_download_file(
                         fh.write(chunk)
                         downloaded += len(chunk)
                         elapsed = asyncio.get_event_loop().time() - t0 or 0.001
-                        speed   = downloaded / elapsed
                         pct     = (downloaded / total * 100) if total else 0
-                        await _update(pct, speed, total)
+                        await _update(pct, downloaded / elapsed, total)
 
     except asyncio.CancelledError:
         return None, "cancelled"
     except Exception as e:
-        logger.error("Invidious download error: %s", e)
+        logger.error("Stream download error: %s", e)
         return None, "error"
 
     if cancel_ev.is_set():
@@ -1009,14 +1107,10 @@ async def _run_download(
     """
     fmt_label = fmt["label"]
 
-    # ── Invidious path (YouTube fallback — no cookies/auth needed) ─────────────
+    # ── Invidious / Piped path (YouTube fallback — no cookies/auth needed) ──────
     if fmt.get("invidious"):
-        ext = fmt.get("invidious_ext", "mp4")
         return await _invidious_download_file(
-            fmt["invidious_video_id"],
-            fmt["invidious_itag"],
-            ext,
-            out_dir, url_hash, cancel_ev, status_msg, fmt_label,
+            fmt, out_dir, url_hash, cancel_ev, status_msg, fmt_label,
         )
 
     # ── yt-dlp subprocess path ────────────────────────────────────────────────
