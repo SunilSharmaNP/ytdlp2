@@ -1,2 +1,5 @@
-python-telegram-bot==21.6
+pyrogram==2.0.106
+TgCrypto
 yt-dlp
+motor
+aiofiles
