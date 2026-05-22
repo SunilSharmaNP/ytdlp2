@@ -15,10 +15,12 @@ YT-DLP Downloader Bot  v4.0
 import asyncio
 import base64
 import hashlib
+import http.server
 import logging
 import os
 import re
 import tempfile
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1345,21 +1347,71 @@ async def _register_commands():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  HEROKU WEB DYNO KEEPALIVE  (prevents SIGKILL every 60s)
+# ═══════════════════════════════════════════════════════════════════════════════
+def _start_keepalive_server() -> None:
+    """
+    Heroku web dynos MUST bind to PORT within 60 s or the process is SIGKILL'd.
+    This minimal HTTP server satisfies that requirement without any extra deps.
+    The bot itself runs on MTProto (long-poll), so no real web server is needed.
+    """
+    port = int(os.environ.get("PORT", 8080))
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = b"OK"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_):
+            pass  # suppress default access log noise
+
+    server = http.server.HTTPServer(("0.0.0.0", port), _Handler)
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    logger.info("Keepalive HTTP server listening on port %d", port)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  COOKIES — MONGODB RESTORE ON STARTUP
 # ═══════════════════════════════════════════════════════════════════════════════
 async def _restore_cookies_from_db() -> None:
-    """Load cookies from MongoDB into a temp file (survives Heroku restarts)."""
+    """
+    Load cookies from MongoDB into a temp file.
+    Retries up to 3 times with a short delay to handle Atlas cold-start latency.
+    """
     global _cookies_path
     if _cookies_path is not None:
         logger.info("Cookies already loaded from env/file — skipping DB restore.")
         return
-    raw = await db_load_cookies()
-    if raw:
-        _RUNTIME_COOKIES.write_bytes(raw)
-        _cookies_path = _RUNTIME_COOKIES
-        logger.info("✅ Cookies restored from MongoDB (%d bytes) → %s", len(raw), _RUNTIME_COOKIES)
-    else:
-        logger.info("No cookies in MongoDB — public content only.")
+    if _settings is None:
+        logger.info("MongoDB not configured — skipping cookie restore.")
+        return
+
+    for attempt in range(1, 4):
+        try:
+            raw = await db_load_cookies()
+            if raw:
+                _RUNTIME_COOKIES.write_bytes(raw)
+                _cookies_path = _RUNTIME_COOKIES
+                logger.info(
+                    "✅ Cookies restored from MongoDB (%d bytes) → %s",
+                    len(raw), _RUNTIME_COOKIES,
+                )
+                return
+            else:
+                logger.info(
+                    "No cookies in MongoDB (attempt %d/3) — waiting 3 s…", attempt
+                )
+                await asyncio.sleep(3)
+        except Exception as e:
+            logger.warning("Cookie restore attempt %d failed: %s", attempt, e)
+            await asyncio.sleep(3)
+
+    logger.info("No cookies found in MongoDB after 3 attempts — public content only.")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1367,6 +1419,10 @@ async def _restore_cookies_from_db() -> None:
 # ═══════════════════════════════════════════════════════════════════════════════
 async def _main():
     from pyrogram.errors import FloodWait as _FloodWait
+
+    # Bind to PORT immediately — MUST happen before Heroku's 60-second timeout.
+    _start_keepalive_server()
+
     retries = 0
     while True:
         try:
@@ -1376,7 +1432,7 @@ async def _main():
                     "Bot v4.0 online | max_size=%s GB | mongo=%s | cookies=%s | session=%s",
                     config.MAX_FILE_SIZE // (1024**3),
                     "✓" if config.MONGO_URI else "✗",
-                    "✓" if _cookies_path else "✗",
+                    "✓" if _cookies_path is not None else "✗",
                     "string" if config.STRING_SESSION else "memory",
                 )
                 await _register_commands()
