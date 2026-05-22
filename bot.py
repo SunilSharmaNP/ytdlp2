@@ -47,8 +47,11 @@ logger = logging.getLogger(__name__)
 # ═══════════════════════════════════════════════════════════════════════════════
 #  PYROGRAM CLIENT
 # ═══════════════════════════════════════════════════════════════════════════════
+# STRING_SESSION keeps the same Telegram session across Heroku restarts.
+# Without it, every restart creates a new auth key → FloodWait 420.
+_session_name = config.STRING_SESSION if config.STRING_SESSION else ":memory:"
 app = Client(
-    ":memory:",
+    _session_name,
     api_id=config.API_ID,
     api_hash=config.API_HASH,
     bot_token=config.BOT_TOKEN,
@@ -60,7 +63,8 @@ app = Client(
 # ═══════════════════════════════════════════════════════════════════════════════
 _mongo_client = AsyncIOMotorClient(config.MONGO_URI) if config.MONGO_URI else None
 _db           = _mongo_client[config.DB_NAME] if _mongo_client is not None else None
-_users        = _db["users"] if _db is not None else None
+_users        = _db["users"]    if _db is not None else None
+_settings     = _db["settings"] if _db is not None else None
 
 
 async def db_upsert_user(user_id: int, first_name: str, username: str | None):
@@ -100,6 +104,44 @@ async def db_set_thumb(user_id: int, file_id: str | None):
         )
     except Exception as e:
         logger.error("db_set_thumb: %s", e)
+
+
+async def db_save_cookies(raw: bytes) -> None:
+    """Persist cookies bytes to MongoDB so they survive Heroku restarts."""
+    if _settings is None:
+        return
+    try:
+        await _settings.update_one(
+            {"_id": "cookies"},
+            {"$set": {"data": base64.b64encode(raw).decode(), "updated_at": datetime.now(timezone.utc)}},
+            upsert=True,
+        )
+        logger.info("Cookies saved to MongoDB (%d bytes).", len(raw))
+    except Exception as e:
+        logger.error("db_save_cookies: %s", e)
+
+
+async def db_load_cookies() -> bytes | None:
+    """Load cookies bytes from MongoDB. Returns None if not stored."""
+    if _settings is None:
+        return None
+    try:
+        doc = await _settings.find_one({"_id": "cookies"})
+        if doc and doc.get("data"):
+            return base64.b64decode(doc["data"])
+    except Exception as e:
+        logger.error("db_load_cookies: %s", e)
+    return None
+
+
+async def db_delete_cookies() -> None:
+    if _settings is None:
+        return
+    try:
+        await _settings.delete_one({"_id": "cookies"})
+        logger.info("Cookies removed from MongoDB.")
+    except Exception as e:
+        logger.error("db_delete_cookies: %s", e)
 
 
 async def db_count_users() -> int:
@@ -168,6 +210,9 @@ broadcast_waiting: set[int] = set()
 
 # admin_id → pyrogram.Message  (message captured, waiting for confirm/cancel)
 broadcast_pending: dict[int, object] = {}
+
+# admin_id → pyrogram.Message  (cookies document message, waiting for confirmation)
+cookies_doc_pending: dict[int, object] = {}
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  PROGRESS REGEX  (yt-dlp --newline output)
@@ -734,28 +779,21 @@ async def cmd_delthumb(_, msg: Message):
 # ═══════════════════════════════════════════════════════════════════════════════
 @app.on_message(filters.command("setcookies") & filters.private)
 async def cmd_setcookies(_, msg: Message):
-    global _cookies_path
     if msg.from_user.id not in config.ADMIN_IDS:
         await msg.reply("⛔ *Admin only.*")
         return
-    reply = msg.reply_to_message
-    if not (reply and reply.document):
-        await msg.reply(
-            "📎 *How to set cookies:*\n\n"
-            "1. Export `cookies.txt` using the *Get cookies.txt LOCALLY* browser extension\n"
-            "2. Send the file in this chat, then reply to it with `/setcookies`"
-        )
-        return
-    info = await msg.reply("⏳ Downloading cookies file…")
-    fp   = await reply.download("cookies.txt")
-    _cookies_path = Path(fp)
-    logger.info("Cookies hot-reloaded from admin upload: %s", fp)
-    await info.edit_text(
-        "✅ *Cookies updated & active immediately!*\n\n"
-        "🍪 New cookies are already in use — **no restart needed**.\n"
-        "All future downloads will use the new cookies file.\n\n"
-        f"📄 Saved as: `{fp}`\n"
-        "🗑 Use /delcookies to remove them."
+    status = "✅ Active" if _cookies_path and _cookies_path.exists() else "❌ Not set"
+    await msg.reply(
+        "🍪 *Cookies Setup*\n\n"
+        f"Current status: {status}\n\n"
+        "📎 *How to set cookies:*\n\n"
+        "1. Export `cookies.txt` from your browser using the\n"
+        "   *Get cookies.txt LOCALLY* extension\n"
+        "2. **Just send the `.txt` file here** — the bot will\n"
+        "   automatically detect it and ask for confirmation\n"
+        "3. Tap ✅ *Yes, Use It* — done!\n\n"
+        "💾 Cookies are saved to MongoDB and survive bot restarts.\n"
+        "🗑 Use /delcookies to remove them at any time."
     )
 
 
@@ -769,7 +807,12 @@ async def cmd_delcookies(_, msg: Message):
     for p in (Path("cookies.txt"), _RUNTIME_COOKIES):
         if p.exists():
             p.unlink()
-    await msg.reply("✅ *Cookies removed.* Bot will only access public content.")
+    await db_delete_cookies()
+    await msg.reply(
+        "✅ *Cookies removed.*\n\n"
+        "🗑 Deleted from both local storage and MongoDB.\n"
+        "Bot will only access public content from now on."
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -809,6 +852,30 @@ async def cmd_cancel(_, msg: Message):
 @app.on_message(filters.private & ~filters.command(""))
 async def on_message(_, msg: Message):
     user = msg.from_user
+
+    # ── Admin sends cookies file directly (auto-detect) ──────────────────────
+    if msg.document and user.id in config.ADMIN_IDS:
+        doc = msg.document
+        fname = (doc.file_name or "").lower()
+        mime  = (doc.mime_type or "").lower()
+        is_txt = fname.endswith(".txt") or "text" in mime or "netscape" in fname
+        if is_txt:
+            cookies_doc_pending[user.id] = msg
+            size_kb = round(doc.file_size / 1024, 1) if doc.file_size else "?"
+            await msg.reply(
+                "🍪 *Cookies File Detected!*\n\n"
+                f"📄 File: `{doc.file_name}`\n"
+                f"📦 Size: `{size_kb} KB`\n\n"
+                "Do you want to use this as the YouTube cookies file?\n"
+                "It will be saved to MongoDB and used immediately — *no restart needed*.",
+                reply_markup=InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton("✅ Yes, Use It",  callback_data="ck_use"),
+                        InlineKeyboardButton("❌ Cancel",       callback_data="ck_cancel"),
+                    ]
+                ]),
+            )
+            return
 
     # ── Broadcast message capture (admin) ────────────────────────────────────
     if user.id in broadcast_waiting:
@@ -987,6 +1054,48 @@ async def on_callback(_, query: CallbackQuery):
         await query.answer("🗑️ Thumbnail removed!", show_alert=True)
         await send_menu(query, chat_id=user.id, thumb=config.THUMB_HOME,
                         text=cap_home(user.first_name), keyboard=kb_home(), is_edit=True)
+        return
+
+    # ── Cookies file confirm / cancel ────────────────────────────────────────
+    if data == "ck_cancel":
+        cookies_doc_pending.pop(user.id, None)
+        await query.answer("❌ Cancelled.", show_alert=False)
+        try:
+            await query.edit_message_text("❌ *Cookies file ignored.*")
+        except Exception:
+            pass
+        return
+
+    if data == "ck_use":
+        if user.id not in config.ADMIN_IDS:
+            await query.answer("⛔ Admin only.", show_alert=True)
+            return
+        doc_msg = cookies_doc_pending.pop(user.id, None)
+        if not doc_msg:
+            await query.answer("⚠️ File expired. Send it again.", show_alert=True)
+            return
+        await query.answer("⏳ Saving…", show_alert=False)
+        try:
+            await query.edit_message_text("⏳ *Downloading and saving cookies…*")
+        except Exception:
+            pass
+        global _cookies_path
+        try:
+            fp  = await doc_msg.download("cookies.txt")
+            raw = Path(fp).read_bytes()
+            _cookies_path = Path(fp)
+            await db_save_cookies(raw)
+            logger.info("Cookies saved via inline button: %s (%d bytes)", fp, len(raw))
+            await query.edit_message_text(
+                "✅ *Cookies activated!*\n\n"
+                f"📄 File: `{doc_msg.document.file_name}`\n"
+                "🍪 Now in use — **no restart needed**.\n"
+                "💾 Saved to MongoDB — survives restarts.\n\n"
+                "_Use /delcookies to remove them._"
+            )
+        except Exception as e:
+            logger.error("ck_use error: %s", e)
+            await query.edit_message_text(f"❌ *Failed to save cookies:*\n`{e}`")
         return
 
     # ── Broadcast confirm / cancel ────────────────────────────────────────────
@@ -1236,18 +1345,54 @@ async def _register_commands():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  COOKIES — MONGODB RESTORE ON STARTUP
+# ═══════════════════════════════════════════════════════════════════════════════
+async def _restore_cookies_from_db() -> None:
+    """Load cookies from MongoDB into a temp file (survives Heroku restarts)."""
+    global _cookies_path
+    if _cookies_path is not None:
+        logger.info("Cookies already loaded from env/file — skipping DB restore.")
+        return
+    raw = await db_load_cookies()
+    if raw:
+        _RUNTIME_COOKIES.write_bytes(raw)
+        _cookies_path = _RUNTIME_COOKIES
+        logger.info("✅ Cookies restored from MongoDB (%d bytes) → %s", len(raw), _RUNTIME_COOKIES)
+    else:
+        logger.info("No cookies in MongoDB — public content only.")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  ENTRY POINT
 # ═══════════════════════════════════════════════════════════════════════════════
 async def _main():
-    async with app:
-        logger.info(
-            "Bot v4.0 online | max_size=%s GB | mongo=%s | cookies=%s",
-            config.MAX_FILE_SIZE // (1024**3),
-            "✓" if config.MONGO_URI else "✗",
-            "✓" if _cookies_path else "✗",
-        )
-        await _register_commands()
-        await idle()
+    from pyrogram.errors import FloodWait as _FloodWait
+    retries = 0
+    while True:
+        try:
+            async with app:
+                await _restore_cookies_from_db()
+                logger.info(
+                    "Bot v4.0 online | max_size=%s GB | mongo=%s | cookies=%s | session=%s",
+                    config.MAX_FILE_SIZE // (1024**3),
+                    "✓" if config.MONGO_URI else "✗",
+                    "✓" if _cookies_path else "✗",
+                    "string" if config.STRING_SESSION else "memory",
+                )
+                await _register_commands()
+                await idle()
+            break
+        except _FloodWait as e:
+            wait = e.value + 5
+            retries += 1
+            logger.warning(
+                "FloodWait %ds from Telegram (attempt %d). Waiting before retry…",
+                wait, retries,
+            )
+            await asyncio.sleep(wait)
+        except Exception as e:
+            logger.error("Startup error: %s", e)
+            raise
 
 
 if __name__ == "__main__":
