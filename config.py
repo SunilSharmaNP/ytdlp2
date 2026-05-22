@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║         YT Downloader Bot v3.0 — Configuration                  ║
+║         YT Downloader Bot v4.0 — Configuration                  ║
 ║  All values can be overridden via environment variables.         ║
 ║  On Heroku: Dashboard → Settings → Config Vars                   ║
 ╚══════════════════════════════════════════════════════════════════╝
@@ -14,6 +14,21 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 # From https://my.telegram.org → My Applications (required for 2 GB uploads)
 API_ID   = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
+
+# ── Pyrogram String Session ────────────────────────────────────────────────────
+# Strongly recommended for Heroku — prevents FloodWait 420 on every restart.
+# Generate the session string ONCE with this one-liner (run locally):
+#
+#   python3 -c "
+#   import asyncio; from pyrogram import Client
+#   async def g():
+#       async with Client('tmp', api_id=YOUR_API_ID, api_hash='YOUR_API_HASH', bot_token='YOUR_BOT_TOKEN') as c:
+#           print(await c.export_session_string())
+#   asyncio.run(g())"
+#
+# Copy the printed string → set STRING_SESSION in Heroku Config Vars.
+# Leave blank only on local dev (re-auths on every run → FloodWait risk on Heroku).
+STRING_SESSION = os.environ.get("STRING_SESSION", "")
 
 # ── MongoDB ────────────────────────────────────────────────────────────────────
 # MongoDB Atlas connection string. Free tier at https://cloud.mongodb.com
