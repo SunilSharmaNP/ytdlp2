@@ -3,3 +3,4 @@ TgCrypto
 yt-dlp>=2024.11.18
 motor
 aiofiles
+aiohttp>=3.9.0
