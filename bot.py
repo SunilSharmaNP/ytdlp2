@@ -656,80 +656,184 @@ def _fetch_formats_sync(url: str) -> tuple:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  COBALT.TOOLS API  — permanent YouTube fallback (no cookies / auth required)
+#  INVIDIOUS API  — permanent YouTube fallback (no cookies / auth required)
 # ═══════════════════════════════════════════════════════════════════════════════
-# cobalt.tools is a free, open-source media downloader API.
-# It handles YouTube internally without any auth or cookies.
-# Docs: https://github.com/imputnet/cobalt
+# Invidious is an open-source YouTube frontend with a public JSON API.
+# Community-run instances use their own residential/VPS IPs →
+# no Heroku datacenter bot-detection. No auth, no cookies, no JWT.
+# API docs: https://docs.invidious.io/api/
+#
+# IMPORTANT: Invidious stream URLs expire quickly (~6h), so we NEVER cache them.
+# We store only (video_id, itag) at format-list time and re-fetch a fresh URL
+# at download time from whichever instance is currently alive.
 
-_COBALT_API   = "https://api.cobalt.tools/"
-_COBALT_HDRS  = {"Accept": "application/json", "Content-Type": "application/json"}
-_COBALT_TIMEOUT = aiohttp.ClientTimeout(total=30)
-
-# Static YouTube quality presets shown when yt-dlp fails to fetch formats.
-# cobalt handles the actual resolution server-side.
-_YT_COBALT_VIDEO_QUALITIES = [
-    ("🎥  4K  (2160p)",      "2160"),
-    ("🎬  2K  (1440p)",      "1440"),
-    ("🎬  Full HD  (1080p)", "1080"),
-    ("📺  HD  (720p)",       "720"),
-    ("📱  480p",             "480"),
-    ("📱  360p",             "360"),
-    ("🔅  240p",             "240"),
-    ("🔅  144p",             "144"),
+_INVIDIOUS_INSTANCES = [
+    "https://inv.nadeko.net",
+    "https://invidious.fdn.fr",
+    "https://invidious.nerdvpn.de",
+    "https://iv.datura.network",
+    "https://invidious.privacydev.net",
+    "https://invidious.lunar.icu",
+    "https://yt.drgnz.club",
 ]
-_YT_COBALT_AUDIO_QUALITIES = [
-    ("🎵  MP3  (best quality)", "mp3",  "best"),
-    ("🔊  AAC",                 "aac",  "best"),
-    ("🔊  Opus",                "opus", "best"),
-]
+_INVIDIOUS_TIMEOUT = aiohttp.ClientTimeout(total=15)
+
+_YT_ID_RE = re.compile(
+    r"(?:youtube\.com/(?:watch\?(?:.*&)?v=|embed/|v/|shorts/)|youtu\.be/)"
+    r"([A-Za-z0-9_-]{11})"
+)
 
 
-async def _cobalt_get_url(
-    url: str,
-    quality: str = "1080",
-    audio_only: bool = False,
-    audio_fmt: str = "mp3",
-) -> tuple[str | None, str, str]:
+def _extract_youtube_id(url: str) -> str | None:
+    """Extract YouTube video ID from any YouTube URL format."""
+    m = _YT_ID_RE.search(url)
+    return m.group(1) if m else None
+
+
+async def _invidious_api_get(path: str) -> dict | None:
     """
-    Call cobalt.tools API and return (download_url, filename, error).
-    download_url is None on failure.
+    Try each Invidious instance in order until one returns a 200 JSON response.
+    Returns parsed dict or None if all fail.
     """
-    payload: dict = {"url": url, "videoQuality": quality, "filenameStyle": "basic"}
-    if audio_only:
-        payload["downloadMode"] = "audio"
-        payload["audioFormat"]  = audio_fmt
-
-    try:
-        async with aiohttp.ClientSession(headers=_COBALT_HDRS, timeout=_COBALT_TIMEOUT) as sess:
-            async with sess.post(_COBALT_API, json=payload) as resp:
-                if resp.status != 200:
-                    text = await resp.text()
-                    return None, "", f"cobalt HTTP {resp.status}: {text[:200]}"
-                data = await resp.json(content_type=None)
-    except Exception as e:
-        return None, "", f"cobalt request failed: {e}"
-
-    status = data.get("status", "")
-    if status in ("stream", "tunnel", "redirect"):
-        return data.get("url"), data.get("filename", "video.mp4"), ""
-    elif status == "picker":
-        items = data.get("picker") or []
-        if items:
-            first = items[0]
-            return first.get("url"), first.get("filename", "video.mp4"), ""
-    # Error response
-    err = data.get("error", {})
-    if isinstance(err, dict):
-        code = err.get("code", "unknown")
-    else:
-        code = str(err)
-    return None, "", f"cobalt error: {code}"
+    for instance in _INVIDIOUS_INSTANCES:
+        url = f"{instance}{path}"
+        try:
+            async with aiohttp.ClientSession(timeout=_INVIDIOUS_TIMEOUT) as sess:
+                async with sess.get(url) as resp:
+                    if resp.status == 200:
+                        return await resp.json(content_type=None)
+        except Exception as e:
+            logger.warning("Invidious instance %s failed: %s", instance, e)
+    return None
 
 
-async def _cobalt_download_file(
-    dl_url: str,
-    filename: str,
+async def _invidious_fetch_info(video_id: str) -> tuple[str | None, str | None, list]:
+    """
+    Fetch video info from Invidious.
+    Returns (title, thumbnail_url, raw_adaptive_formats_list).
+    """
+    data = await _invidious_api_get(
+        f"/api/v1/videos/{video_id}"
+        f"?fields=title,videoThumbnails,adaptiveFormats"
+    )
+    if not data:
+        return None, None, []
+
+    title  = data.get("title")
+    thumbs = data.get("videoThumbnails", [])
+    thumb  = None
+    for quality in ("maxresdefault", "sddefault", "high", "medium", "default"):
+        for t in thumbs:
+            if t.get("quality") == quality:
+                thumb = t.get("url")
+                break
+        if thumb:
+            break
+    if not thumb and thumbs:
+        thumb = thumbs[0].get("url")
+
+    raw_formats = data.get("adaptiveFormats", [])
+    return title, thumb, raw_formats
+
+
+async def _invidious_get_stream_url(video_id: str, itag: str) -> tuple[str | None, str]:
+    """
+    Re-fetch a FRESH stream URL for (video_id, itag) at download time.
+    Returns (stream_url, error_string). stream_url is None on failure.
+    """
+    data = await _invidious_api_get(
+        f"/api/v1/videos/{video_id}?fields=adaptiveFormats"
+    )
+    if not data:
+        return None, "All Invidious instances failed"
+    for fmt in data.get("adaptiveFormats", []):
+        if str(fmt.get("itag")) == str(itag):
+            stream_url = fmt.get("url")
+            if stream_url:
+                return stream_url, ""
+    return None, f"itag {itag} not found in Invidious response"
+
+
+def _parse_invidious_formats(raw_formats: list, video_id: str) -> list[dict]:
+    """
+    Convert Invidious adaptiveFormats to our internal format dict list.
+    We store only (video_id, itag) — NOT the URL (it expires).
+    At download time _invidious_get_stream_url() re-fetches a fresh URL.
+    """
+    _QEMOJI = {
+        "2160p": "🎥", "1440p": "🎬", "1080p": "🎬",
+        "720p":  "📺", "480p":  "📱", "360p":  "📱",
+        "240p":  "🔅", "144p":  "🔅",
+    }
+
+    seen_video: set[str] = set()
+    seen_audio: set[str] = set()
+    fmts: list[dict]     = []
+
+    # ── Video ─────────────────────────────────────────────────────────────────
+    video_raw = [
+        f for f in raw_formats
+        if f.get("type", "").startswith("video/") and f.get("qualityLabel")
+    ]
+    # Sort descending by vertical resolution (e.g. "1920x1080" → 1080)
+    def _vres(f: dict) -> int:
+        res = f.get("resolution", "0x0")
+        try:
+            return int(res.split("x")[-1])
+        except Exception:
+            return 0
+    video_raw.sort(key=_vres, reverse=True)
+
+    for f in video_raw:
+        qlabel = f.get("qualityLabel", "")
+        mime   = f.get("type", "")
+        codec  = "mp4" if "mp4" in mime else "webm"
+        itag   = str(f.get("itag", ""))
+        key    = f"{qlabel}_{codec}"
+        if key in seen_video:
+            continue
+        seen_video.add(key)
+        emoji = _QEMOJI.get(qlabel, "🎬")
+        fmts.append({
+            "label":              f"{emoji}  {qlabel}  [{codec.upper()}]",
+            "is_audio":           False,
+            "invidious":          True,
+            "invidious_video_id": video_id,
+            "invidious_itag":     itag,
+            "invidious_ext":      codec,
+        })
+
+    # ── Audio ─────────────────────────────────────────────────────────────────
+    audio_raw = [
+        f for f in raw_formats
+        if f.get("type", "").startswith("audio/")
+    ]
+    audio_raw.sort(key=lambda f: int(f.get("bitrate", 0)), reverse=True)
+
+    for f in audio_raw:
+        mime  = f.get("type", "")
+        codec = "opus" if "opus" in mime else "m4a"
+        itag  = str(f.get("itag", ""))
+        if codec in seen_audio:
+            continue
+        seen_audio.add(codec)
+        ext_label = "Opus (WebM)" if codec == "opus" else "M4A (AAC)"
+        fmts.append({
+            "label":              f"🎵  Audio — {ext_label}",
+            "is_audio":           True,
+            "invidious":          True,
+            "invidious_video_id": video_id,
+            "invidious_itag":     itag,
+            "invidious_ext":      codec,
+        })
+
+    return fmts
+
+
+async def _invidious_download_file(
+    video_id: str,
+    itag: str,
+    ext: str,
     out_dir: str,
     url_hash: str,
     cancel_ev: asyncio.Event,
@@ -737,13 +841,27 @@ async def _cobalt_download_file(
     fmt_label: str,
 ) -> tuple[str | None, str]:
     """
-    Download a file from a direct URL (cobalt stream) to out_dir.
-    Shows live progress. Returns (filepath, "done"|"cancelled"|"error").
+    Fetch a fresh stream URL from Invidious, then stream-download it.
+    Returns (filepath, "done"|"cancelled"|"error").
     """
+    try:
+        await status_msg.edit_text(
+            f"🔗 *Getting stream URL…*\n\n📌 *{fmt_label}*",
+            reply_markup=kb_cancel(url_hash),
+        )
+    except Exception:
+        pass
+
+    stream_url, err = await _invidious_get_stream_url(video_id, itag)
+    if not stream_url:
+        logger.error("Invidious stream URL failed: %s", err)
+        return None, "error"
+
+    filename = f"{video_id}_{itag}.{ext}"
     filepath = os.path.join(out_dir, filename)
     last_edit = 0.0
 
-    async def _update(pct: float, speed_bps: float, downloaded: int, total: int):
+    async def _update(pct: float, speed_bps: float, total: int):
         nonlocal last_edit
         now = asyncio.get_event_loop().time()
         if now - last_edit < 4:
@@ -767,10 +885,11 @@ async def _cobalt_download_file(
 
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=3600)) as sess:
-            async with sess.get(dl_url) as resp:
+            async with sess.get(stream_url) as resp:
                 if resp.status not in (200, 206):
+                    logger.error("Invidious stream returned HTTP %s", resp.status)
                     return None, "error"
-                total     = int(resp.headers.get("Content-Length", 0))
+                total      = int(resp.headers.get("Content-Length", 0))
                 downloaded = 0
                 t0         = asyncio.get_event_loop().time()
 
@@ -783,43 +902,17 @@ async def _cobalt_download_file(
                         elapsed = asyncio.get_event_loop().time() - t0 or 0.001
                         speed   = downloaded / elapsed
                         pct     = (downloaded / total * 100) if total else 0
-                        await _update(pct, speed, downloaded, total)
+                        await _update(pct, speed, total)
 
     except asyncio.CancelledError:
         return None, "cancelled"
     except Exception as e:
-        logger.error("cobalt download error: %s", e)
+        logger.error("Invidious download error: %s", e)
         return None, "error"
 
     if cancel_ev.is_set():
         return None, "cancelled"
     return filepath, "done"
-
-
-def _make_cobalt_formats(url: str) -> list[dict]:
-    """
-    Build a static quality list for YouTube via cobalt.tools.
-    Called when yt-dlp fails to fetch formats for a YouTube URL.
-    """
-    fmts: list[dict] = []
-    for label, quality in _YT_COBALT_VIDEO_QUALITIES:
-        fmts.append({
-            "label":         label,
-            "is_audio":      False,
-            "cobalt":        True,
-            "cobalt_url":    url,
-            "cobalt_quality": quality,
-        })
-    for label, audio_fmt, _ in _YT_COBALT_AUDIO_QUALITIES:
-        fmts.append({
-            "label":           label,
-            "is_audio":        True,
-            "cobalt":          True,
-            "cobalt_url":      url,
-            "cobalt_quality":  "max",
-            "cobalt_audio_fmt": audio_fmt,
-        })
-    return fmts
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -911,32 +1004,19 @@ async def _run_download(
     status_msg,
 ) -> tuple[str | None, str]:
     """
-    Dispatcher: routes to either the cobalt downloader (for YouTube cobalt-fallback
-    formats) or the yt-dlp subprocess downloader (for all other formats).
+    Dispatcher: routes to Invidious downloader (YouTube fallback) or yt-dlp.
     Returns (filepath, "done" | "cancelled" | "error").
     """
     fmt_label = fmt["label"]
 
-    # ── cobalt.tools path (YouTube fallback) ──────────────────────────────────
-    if fmt.get("cobalt"):
-        try:
-            await status_msg.edit_text(
-                f"🔗 *Getting download link…*\n\n📌 *{fmt_label}*",
-                reply_markup=kb_cancel(url_hash),
-            )
-        except Exception:
-            pass
-        dl_url, filename, err = await _cobalt_get_url(
-            fmt["cobalt_url"],
-            quality    = fmt.get("cobalt_quality", "1080"),
-            audio_only = fmt.get("is_audio", False),
-            audio_fmt  = fmt.get("cobalt_audio_fmt", "mp3"),
-        )
-        if not dl_url:
-            logger.error("cobalt_get_url failed: %s", err)
-            return None, "error"
-        return await _cobalt_download_file(
-            dl_url, filename, out_dir, url_hash, cancel_ev, status_msg, fmt_label
+    # ── Invidious path (YouTube fallback — no cookies/auth needed) ─────────────
+    if fmt.get("invidious"):
+        ext = fmt.get("invidious_ext", "mp4")
+        return await _invidious_download_file(
+            fmt["invidious_video_id"],
+            fmt["invidious_itag"],
+            ext,
+            out_dir, url_hash, cancel_ev, status_msg, fmt_label,
         )
 
     # ── yt-dlp subprocess path ────────────────────────────────────────────────
@@ -1252,25 +1332,34 @@ async def handle_url(msg: Message, user, url: str):
         None, _fetch_formats_sync, url
     )
 
-    # ── cobalt.tools fallback for YouTube ─────────────────────────────────────
-    # When yt-dlp fails to fetch YouTube formats (bot-detection, IP block, etc.),
-    # we fall back to cobalt.tools which needs NO cookies, NO auth — permanent fix.
-    using_cobalt = False
+    # ── Invidious fallback for YouTube ────────────────────────────────────────
+    # When yt-dlp fails (Heroku IP bot-detected by YouTube), we fall back to
+    # Invidious — a community-run open-source YouTube frontend with its own IPs.
+    # No cookies, no JWT, no auth ever needed. Permanent solution.
+    using_invidious = False
     if not formats and _is_youtube_url(url):
-        logger.info("yt-dlp failed for YouTube URL — switching to cobalt.tools fallback.")
-        try:
-            await status.edit_text(
-                "⚙️ *yt-dlp blocked by YouTube…*\n"
-                "🔄 Switching to alternative downloader (cobalt.tools)\n"
-                "_This requires no cookies and works permanently!_"
+        video_id = _extract_youtube_id(url)
+        if video_id:
+            logger.info(
+                "yt-dlp failed for YouTube — trying Invidious fallback (video_id=%s)", video_id
             )
-        except Exception:
-            pass
-        await asyncio.sleep(1.5)
-        formats = _make_cobalt_formats(url)
-        using_cobalt = True
-        title = title or "YouTube Video"
-        thumb = thumb or config.THUMB_DEFAULT
+            try:
+                await status.edit_text(
+                    "⚙️ *yt-dlp blocked by YouTube…*\n"
+                    "🔄 Switching to *Invidious* (community servers — no bot detection!)\n"
+                    "_Fetching real quality options…_"
+                )
+            except Exception:
+                pass
+
+            inv_title, inv_thumb, inv_raw = await _invidious_fetch_info(video_id)
+            if inv_raw:
+                formats          = _parse_invidious_formats(inv_raw, video_id)
+                title            = inv_title or title or "YouTube Video"
+                thumb            = inv_thumb or thumb or config.THUMB_DEFAULT
+                using_invidious  = True
+            else:
+                logger.warning("Invidious also failed for video_id=%s", video_id)
 
     if not formats:
         err_detail = ""
@@ -1295,12 +1384,12 @@ async def handle_url(msg: Message, user, url: str):
     }
 
     short = title[:60] + ("…" if len(title) > 60 else "")
-    cobalt_note = "\n_⚡ Powered by cobalt.tools — no cookies needed_" if using_cobalt else ""
+    inv_note = "\n_⚡ Via Invidious — no cookies needed_" if using_invidious else ""
     cap = (
         f"🎬 *{short}*\n\n"
         f"📊 *Choose your quality:*\n"
         f"_({len(formats)} options — tap to start downloading)_"
-        + cobalt_note
+        + inv_note
     )
 
     await status.delete()
