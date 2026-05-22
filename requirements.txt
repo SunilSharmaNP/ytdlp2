@@ -1,5 +1,5 @@
 pyrogram==2.0.106
 TgCrypto
-yt-dlp
+yt-dlp>=2024.11.18
 motor
 aiofiles
